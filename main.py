@@ -337,13 +337,12 @@ class RunPod:
             "bash -lc 'set -e; "
             "echo \"[bootstrap] iniciando\"; "
             "apt-get update -qq; "
-            # FIX: agregado xvfb (pantalla virtual para COLMAP headless)
             "apt-get install -y -qq git wget ffmpeg colmap python3-pip "
-            "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb; "
-            "echo \"[bootstrap] sistema OK (con xvfb)\"; "
+            "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb ninja-build; "
+            "echo \"[bootstrap] sistema OK (con xvfb + ninja)\"; "
             "pip install -q --upgrade pip; "
-            "pip install -q boto3 plyfile opencv-python-headless requests tqdm numpy pillow; "
-            # FIX: asegurar torch + torchvision (algunas imagenes no traen torchvision)
+            "pip install -q boto3 plyfile opencv-python-headless requests tqdm pillow; "
+            # torch/torchvision (la imagen base los trae, pero por si acaso)
             "python3 -c \"import torch\" 2>/dev/null || "
             "  pip install -q torch==2.1.2 torchvision==0.16.2 "
             "  --index-url https://download.pytorch.org/whl/cu121; "
@@ -351,16 +350,27 @@ class RunPod:
             "  pip install -q torchvision==0.16.2 "
             "  --index-url https://download.pytorch.org/whl/cu121; "
             "pip install -q transformers accelerate timm safetensors huggingface_hub; "
-            "echo \"[bootstrap] python deps OK\"; "
-            "python3 -c \"import torch, torchvision; print(f\\\"[bootstrap] torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
-            # git clone idempotente
+            # FIX CRÍTICO v3.7: transformers arrastra NumPy 2.x que ROMPE torch 2.1.
+            # Forzamos numpy<2 al FINAL para mantener compatibilidad con torch precompilado.
+            "pip install -q \"numpy<2\" --force-reinstall; "
+            "echo \"[bootstrap] python deps OK (numpy<2 forzado)\"; "
+            "python3 -c \"import numpy, torch, torchvision; print(f\\\"[bootstrap] numpy {numpy.__version__} torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
+            # FIX CRÍTICO v3.7: --recursive trae el submódulo glm (glm/glm.hpp que faltaba).
+            # Sin --recursive, gsplat NO compila.
             "if [ ! -d /opt/gsplat-repo/.git ]; then "
-            "  git clone --branch v1.4.0 --depth 1 "
+            "  git clone --recursive --branch v1.4.0 --depth 1 "
             "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
-            "else echo \"[bootstrap] gsplat-repo ya existe\"; fi; "
+            "else "
+            "  echo \"[bootstrap] gsplat-repo existe, actualizando submódulos\"; "
+            "  cd /opt/gsplat-repo && git submodule update --init --recursive; "
+            "fi; "
             "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
             "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
-            "echo \"[bootstrap] gsplat v1.4.0 OK\"; "
+            # Reforzar numpy<2 otra vez (examples/requirements puede re-instalar numpy 2)
+            "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
+            # Verificar que gsplat compiló de verdad (no solo que el comando terminó)
+            "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
+            "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
             "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
             f"wget -q -O /workspace/worker.py \"{WORKER_SCRIPT_URL}\"; "
             "echo \"[bootstrap] worker descargado, ejecutando\"; "
