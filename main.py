@@ -60,7 +60,7 @@ GPU_PREFERENCE_NAMES = [
     "NVIDIA GeForce RTX 4090",            # 24GB · Ada · best perf/$ para 3DGS
 
     # ───── Premium Ada Lovelace (mismo arch que 4090, más VRAM) ─────
-    "NVIDIA RTX 6000 Ada",     # 48GB · Ada · doble VRAM, ideal escenas grandes
+    "NVIDIA RTX 6000 Ada Generation",     # 48GB · Ada · doble VRAM, ideal escenas grandes
     "NVIDIA L40S",                         # 48GB · Ada · datacenter
     "NVIDIA L40",                          # 48GB · Ada
 
