@@ -52,13 +52,51 @@ POD_MIN_MEMORY_GB     = 32
 
 # GPU preferida (RTX 4090) y fallbacks COMPATIBLES con nuestro stack
 # Excluye Blackwell (RTX PRO 6000) que rompía PyTorch 2.1
+# Ranking PURO POR RENDIMIENTO para 3D Gaussian Splatting.
+# RunPod prueba en este orden; salta si una no está disponible.
+# Excluye Blackwell (rompe PyTorch 2.1) y H100/H200 (overkill caro).
 GPU_PREFERENCE_NAMES = [
-    "NVIDIA GeForce RTX 4090",
-    "NVIDIA RTX A6000",
-    "NVIDIA GeForce RTX 3090",
-    "NVIDIA RTX 6000 Ada Generation",
-    "NVIDIA L40",
+    # ───── 1° lugar — la que pediste primero ─────
+    "NVIDIA GeForce RTX 4090",            # 24GB · Ada · best perf/$ para 3DGS
+
+    # ───── Premium Ada Lovelace (mismo arch que 4090, más VRAM) ─────
+    "NVIDIA RTX 6000 Ada Generation",     # 48GB · Ada · doble VRAM, ideal escenas grandes
+    "NVIDIA L40S",                         # 48GB · Ada · datacenter
+    "NVIDIA L40",                          # 48GB · Ada
+
+    # ───── A100 (Ampere top, mucha VRAM) ─────
+    "NVIDIA A100-SXM4-80GB",              # 80GB · Ampere · máxima banda ancha
+    "NVIDIA A100 80GB PCIe",              # 80GB · Ampere
+    "NVIDIA A100 80GB",                   # alias por si RunPod renombra
+    "NVIDIA A100-PCIE-40GB",              # 40GB · Ampere
+
+    # ───── Pro Ampere (48GB) ─────
+    "NVIDIA RTX A6000",                   # 48GB · Ampere · gran VRAM, casi siempre disponible
+    "NVIDIA A40",                          # 48GB · Ampere · datacenter equivalente
+
+    # ───── Consumer Ampere 24GB ─────
+    "NVIDIA GeForce RTX 3090 Ti",         # 24GB · Ampere top consumer
+    "NVIDIA GeForce RTX 3090",            # 24GB · Ampere
+    "NVIDIA RTX A5000",                   # 24GB · Ampere pro
+
+    # ───── Ada recortadas / Ampere VRAM justa ─────
+    "NVIDIA L4",                           # 24GB · Ada inference-oriented
+    "NVIDIA RTX A4500",                   # 20GB · Ampere · VRAM justa
+    "NVIDIA RTX A4000",                   # 16GB · Ampere · último recurso (solo fast)
 ]
+
+# Configuración auto-adaptativa de disco según GPU
+GPU_DISK_CONFIG = {
+    # GPUs de 80GB VRAM (A100) → más disco para modelos cacheados
+    "NVIDIA A100-SXM4-80GB":      {"container": 60, "volume": 120},
+    "NVIDIA A100 80GB PCIe":      {"container": 60, "volume": 120},
+    "NVIDIA A100 80GB":           {"container": 60, "volume": 120},
+    "NVIDIA A100-PCIE-40GB":      {"container": 60, "volume": 120},
+    # GPUs con VRAM justa → ahorramos disco también
+    "NVIDIA RTX A4500":           {"container": 40, "volume": 80},
+    "NVIDIA RTX A4000":           {"container": 40, "volume": 80},
+    # El resto (24-48GB): configuración estándar que pediste (50/100)
+}
 
 # URL pública del worker.py en GitHub (lo que el pod baja al arrancar)
 WORKER_SCRIPT_URL   = os.environ.get(
@@ -202,33 +240,92 @@ class RunPod:
 
     @staticmethod
     async def find_best_gpu():
-        """Encuentra el primer GPU type disponible según la preferencia."""
-        # Listar todos los tipos de GPU disponibles
+        """Devuelve (gpu_id, gpu_name) según el ranking de preferencia.
+        El orden es por RENDIMIENTO; RunPod salta automáticamente las no disponibles
+        al intentar el podFindAndDeployOnDemand."""
         try:
             data = await RunPod._query("""
                 query { gpuTypes { id displayName memoryInGb } }
             """)
         except Exception as e:
             print(f"[runpod] find_best_gpu error: {e}")
-            return None
+            return None, None
 
         all_gpus = data.get("gpuTypes", [])
-        # Mapeo nombre → id
         by_name = {g["displayName"]: g["id"] for g in all_gpus}
 
-        # Buscar el primero de nuestra preferencia que exista
+        # Recorrer la lista preferida EN ORDEN — RunPod usará la primera que exista
+        # y que tenga capacidad. Si la #1 no hay, el caller reintenta con la #2, etc.
         for pref in GPU_PREFERENCE_NAMES:
             if pref in by_name:
-                return by_name[pref]
-        # Fallback: cualquier GPU con ≥24 GB
+                print(f"[runpod] GPU intentada: {pref}")
+                return by_name[pref], pref
+        # Último fallback: cualquier GPU con ≥24 GB que NO sea Blackwell
+        BLACKWELL_BANNED = ("RTX 5090", "RTX PRO 6000", "RTX PRO 4500",
+                            "RTX PRO 4000", "B200", "B300")
         for g in all_gpus:
-            if g.get("memoryInGb", 0) >= 24:
-                return g["id"]
-        return None
+            name = g.get("displayName", "")
+            if g.get("memoryInGb", 0) >= 24 and not any(b in name for b in BLACKWELL_BANNED):
+                print(f"[runpod] GPU fallback genérico: {name}")
+                return g["id"], name
+        return None, None
 
     @staticmethod
-    async def create_pod(job_id, gpu_type_id, env_vars):
+    def disk_config_for(gpu_name):
+        """Config óptima de disco según GPU asignada."""
+        return GPU_DISK_CONFIG.get(gpu_name, {
+            "container": POD_CONTAINER_DISK_GB,
+            "volume": POD_VOLUME_DISK_GB,
+        })
+
+    @staticmethod
+    async def try_create_pod_with_fallbacks(job_id, env_vars):
+        """Intenta crear el pod recorriendo el ranking de GPUs.
+        Si una falla con SUPPLY_CONSTRAINT, prueba la siguiente automáticamente.
+        Devuelve (pod, gpu_name, disk) o lanza excepción si todas fallaron."""
+        try:
+            data = await RunPod._query("""
+                query { gpuTypes { id displayName memoryInGb } }
+            """)
+        except Exception as e:
+            raise RuntimeError(f"No pude listar GPUs de RunPod: {e}")
+        all_gpus = data.get("gpuTypes", [])
+        by_name = {g["displayName"]: g["id"] for g in all_gpus}
+
+        errors = []
+        for pref in GPU_PREFERENCE_NAMES:
+            gpu_id = by_name.get(pref)
+            if not gpu_id:
+                continue
+            disk = RunPod.disk_config_for(pref)
+            print(f"[fallback] Intentando {pref} (cont={disk['container']} vol={disk['volume']})")
+            try:
+                pod = await RunPod.create_pod(
+                    job_id, gpu_id, env_vars,
+                    container_gb=disk["container"],
+                    volume_gb=disk["volume"],
+                )
+                print(f"[fallback] ✓ {pref} alquilada exitosamente")
+                return pod, pref, disk
+            except Exception as e:
+                msg = str(e)
+                # Si es supply constraint, probar la siguiente del ranking
+                if "SUPPLY_CONSTRAINT" in msg or "no longer any instances" in msg.lower():
+                    print(f"[fallback] {pref} sin disponibilidad, probando siguiente...")
+                    errors.append(f"{pref}: sin stock")
+                    continue
+                # Otros errores: re-lanzar
+                raise
+        raise RuntimeError(
+            f"Ninguna GPU del ranking está disponible ahora. "
+            f"Intentos: {'; '.join(errors[:5])}. Reintenta en 5-10 min."
+        )
+
+    @staticmethod
+    async def create_pod(job_id, gpu_type_id, env_vars, container_gb=None, volume_gb=None):
         """Crea un Pod on-demand. Bootstrap descarga worker.py y lo ejecuta."""
+        container_gb = container_gb or POD_CONTAINER_DISK_GB
+        volume_gb = volume_gb or POD_VOLUME_DISK_GB
         # Bootstrap: instala COLMAP, gsplat, deps, baja worker.py, lo corre
         bootstrap = (
             "bash -lc 'set -e; "
@@ -263,8 +360,8 @@ class RunPod:
         variables = {"input": {
             "cloudType":"SECURE",
             "gpuCount":1,
-            "volumeInGb": POD_VOLUME_DISK_GB,       # 100 GB ← lo que pediste
-            "containerDiskInGb": POD_CONTAINER_DISK_GB,  # 50 GB ← lo que pediste
+            "volumeInGb": volume_gb,            # auto-ajustado a la GPU
+            "containerDiskInGb": container_gb,  # auto-ajustado a la GPU
             "minVcpuCount": POD_MIN_VCPU,
             "minMemoryInGb": POD_MIN_MEMORY_GB,
             "gpuTypeId": gpu_type_id,
@@ -275,7 +372,7 @@ class RunPod:
             "volumeMountPath":"/workspace",
             "env": env_list,
         }}
-        print(f"[runpod] Creando pod gpu={gpu_type_id} cont={POD_CONTAINER_DISK_GB}GB vol={POD_VOLUME_DISK_GB}GB")
+        print(f"[runpod] Creando pod gpu={gpu_type_id} cont={container_gb}GB vol={volume_gb}GB")
         data = await RunPod._query(mutation, variables)
         return data["podFindAndDeployOnDemand"]
 
@@ -353,13 +450,7 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
         job_update(job_id, status="error", error=f"R2 upload falló: {e}")
         raise HTTPException(500, f"R2 falló: {e}")
 
-    # Encontrar GPU disponible
-    gpu_id = await RunPod.find_best_gpu()
-    if not gpu_id:
-        job_update(job_id, status="error", error="No hay GPU disponible (4090 ni fallbacks)")
-        raise HTTPException(503, "Sin GPU disponible. Reintenta en unos minutos.")
-
-    # Crear Pod
+    # Construir env vars del pod
     env = {
         "TOUR_ID": job_id,
         "INPUT_URL": r2_get_url(zip_key, expires=7200),
@@ -369,17 +460,22 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
         "CALLBACK_SECRET": CALLBACK_SECRET,
         "QUALITY": quality,
     }
+
+    # Recorrer el ranking de GPUs hasta encontrar una con stock
     try:
-        pod = await RunPod.create_pod(job_id, gpu_id, env)
+        pod, gpu_name, disk = await RunPod.try_create_pod_with_fallbacks(job_id, env)
     except Exception as e:
         job_update(job_id, status="error", error=f"Crear Pod falló: {e}")
-        raise HTTPException(500, f"Crear Pod falló: {e}")
+        raise HTTPException(503, f"Sin GPU disponible: {e}")
 
-    job_update(job_id, status="processing", pod_id=pod.get("id",""),
-               gpu_type=gpu_id, message="Pod arrancando (~5 min bootstrap)")
+    job_update(job_id, status="processing",
+               pod_id=pod.get("id",""),
+               gpu_type=gpu_name,
+               message=f"Pod {gpu_name} arrancando (~5 min bootstrap)")
 
     return {"job_id":job_id, "status":"processing", "quality":quality,
-            "pod_id":pod.get("id"), "gpu_type":gpu_id}
+            "pod_id":pod.get("id"), "gpu_type":gpu_name,
+            "container_gb":disk["container"], "volume_gb":disk["volume"]}
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
