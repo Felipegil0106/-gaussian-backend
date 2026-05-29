@@ -52,64 +52,39 @@ POD_MIN_MEMORY_GB     = 32
 
 # GPU preferida (RTX 4090) y fallbacks COMPATIBLES con nuestro stack
 # Excluye Blackwell (RTX PRO 6000) que rompía PyTorch 2.1
-# Ranking PURO POR RENDIMIENTO para 3D Gaussian Splatting.
-# Cada entrada: (etiqueta_visible, [keywords_obligatorios], [keywords_PROHIBIDOS_para_evitar_falsos_matches])
-# El matching es flexible: encuentra GPUs cuyo displayName contenga TODOS los keywords
-# obligatorios y NINGUNO de los prohibidos. Insensible a mayúsculas/NVIDIA prefix/guiones.
-#
-# Por ejemplo, "L40S" matchea "NVIDIA L40S" pero NO matchea "NVIDIA L40" gracias al prohibido.
-#
-# Excluye Blackwell (rompe PyTorch 2.1) y H100/H200 (carísimas).
+# Ranking por rendimiento puro. Matching FLEXIBLE por keywords.
 GPU_PREFERENCES = [
-    # ─── 🥇 1° — la que pediste primera ─────────────────────────────
     ("RTX 4090",        ["4090"],                ["pro", "ti", "mobile"]),
-
-    # ─── Premium Ada Lovelace (mismo arch, más VRAM) ────────────────
     ("RTX 6000 Ada",    ["6000", "ada"],         ["pro"]),
     ("L40S",            ["l40s"],                []),
     ("L40",             ["l40"],                 ["l40s"]),
-
-    # ─── A100 (Ampere top, 40-80GB) ─────────────────────────────────
     ("A100 SXM 80GB",   ["a100", "sxm", "80"],   []),
     ("A100 PCIe 80GB",  ["a100", "pcie", "80"],  ["sxm"]),
     ("A100 80GB",       ["a100", "80"],          ["sxm", "pcie"]),
     ("A100 PCIe 40GB",  ["a100", "pcie", "40"],  ["80", "sxm"]),
     ("A100 40GB",       ["a100", "40"],          ["80", "sxm", "pcie"]),
-
-    # ─── Pro Ampere (48GB) ──────────────────────────────────────────
     ("RTX A6000",       ["a6000"],               ["ada"]),
     ("A40",             ["a40"],                 ["rtx", "ada"]),
-
-    # ─── Consumer Ampere 24GB ───────────────────────────────────────
     ("RTX 3090 Ti",     ["3090", "ti"],          []),
     ("RTX 3090",        ["3090"],                ["ti"]),
     ("RTX A5000",       ["a5000"],               ["ada"]),
-
-    # ─── Ada recortadas / Ampere VRAM justa ─────────────────────────
     ("L4",              ["l4"],                  ["l40", "l4d"]),
     ("RTX A4500",       ["a4500"],               ["pro", "ada"]),
     ("RTX A4000",       ["a4000"],               ["pro", "ada"]),
 ]
 
-# Configuración auto-adaptativa de disco según GPU
-# (clave = etiqueta_visible de GPU_PREFERENCES)
 GPU_DISK_CONFIG = {
-    # GPUs de 80GB VRAM → más disco para modelos cacheados
     "A100 SXM 80GB":   {"container": 60, "volume": 120},
     "A100 PCIe 80GB":  {"container": 60, "volume": 120},
     "A100 80GB":       {"container": 60, "volume": 120},
     "A100 PCIe 40GB":  {"container": 60, "volume": 120},
     "A100 40GB":       {"container": 60, "volume": 120},
-    # GPUs con VRAM justa → ahorramos disco
     "RTX A4500":       {"container": 40, "volume": 80},
     "RTX A4000":       {"container": 40, "volume": 80},
-    # Resto: 50/100 (la base que pediste)
 }
 
-# GPUs PROHIBIDAS (Blackwell, H100/H200 caras) — palabras a NUNCA aceptar
 BANNED_GPU_KEYWORDS = [
-    "5090", "rtx pro", "b200", "b300",   # Blackwell
-    "h100", "h200",                       # demasiado caras
+    "5090", "rtx pro", "b200", "b300", "h100", "h200",
 ]
 
 # URL pública del worker.py en GitHub (lo que el pod baja al arrancar)
@@ -254,7 +229,6 @@ class RunPod:
 
     @staticmethod
     def _matches(display_name, keywords_req, keywords_forbidden):
-        """¿El displayName contiene TODOS los keywords requeridos y NINGUNO prohibido?"""
         n = display_name.lower()
         if any(b in n for b in BANNED_GPU_KEYWORDS):
             return False
@@ -266,7 +240,6 @@ class RunPod:
 
     @staticmethod
     async def list_all_gpus():
-        """Lista TODOS los tipos de GPU del catálogo de RunPod (para debug)."""
         try:
             data = await RunPod._query("""
                 query { gpuTypes { id displayName memoryInGb } }
@@ -278,7 +251,6 @@ class RunPod:
 
     @staticmethod
     def disk_config_for(label):
-        """Config óptima de disco según etiqueta de GPU."""
         return GPU_DISK_CONFIG.get(label, {
             "container": POD_CONTAINER_DISK_GB,
             "volume": POD_VOLUME_DISK_GB,
@@ -286,16 +258,12 @@ class RunPod:
 
     @staticmethod
     async def try_create_pod_with_fallbacks(job_id, env_vars):
-        """Recorre el ranking, hace KEYWORD MATCHING flexible y prueba en orden.
-        Si la #1 no está disponible (SUPPLY_CONSTRAINT), prueba la #2, etc.
-        Devuelve (pod, gpu_label, gpu_displayname, disk) o lanza excepción."""
+        """Recorre el ranking con keyword matching y cascada automática."""
         all_gpus = await RunPod.list_all_gpus()
         if not all_gpus:
-            raise RuntimeError("RunPod no devolvió ninguna GPU. ¿API key correcta?")
+            raise RuntimeError("RunPod no devolvió GPUs. ¿API key correcta?")
 
-        # Build candidatos ordenados por nuestro ranking
-        # Para cada preferencia, encuentra TODOS los GPUs que matchean (no solo el 1°)
-        candidates = []  # lista de (label, gpu_displayname, gpu_id, vram_gb)
+        candidates = []
         seen_ids = set()
         for label, req, forb in GPU_PREFERENCES:
             for g in all_gpus:
@@ -306,10 +274,9 @@ class RunPod:
                 if RunPod._matches(name, req, forb):
                     candidates.append((label, name, gid, g.get("memoryInGb", 0)))
                     seen_ids.add(gid)
-                    break  # solo el primer match por preferencia
+                    break
 
-        # Fallback de emergencia: si tras el ranking quedó algo, agregar cualquier
-        # GPU compatible con ≥20GB VRAM no agregada ya
+        # Fallback de emergencia: cualquier GPU con ≥20GB no Blackwell
         for g in all_gpus:
             gid = g.get("id")
             name = g.get("displayName", "")
@@ -325,11 +292,10 @@ class RunPod:
         if not candidates:
             available = ", ".join(g.get("displayName", "?") for g in all_gpus[:8])
             raise RuntimeError(
-                f"Ninguna GPU compatible encontrada. RunPod tiene: {available}..."
+                f"Ninguna GPU compatible. RunPod tiene: {available}..."
             )
 
-        print(f"[fallback] Lista de candidatos en orden: "
-              f"{[c[0] for c in candidates[:8]]}...")
+        print(f"[fallback] Candidatos en orden: {[c[0] for c in candidates[:10]]}")
 
         errors = []
         for label, display_name, gid, vram in candidates:
@@ -341,7 +307,7 @@ class RunPod:
                     container_gb=disk["container"],
                     volume_gb=disk["volume"],
                 )
-                print(f"[fallback] ✓ {label} alquilada exitosamente")
+                print(f"[fallback] ✓ {label} alquilada")
                 return pod, label, display_name, disk
             except Exception as e:
                 msg = str(e)
@@ -349,13 +315,11 @@ class RunPod:
                     print(f"[fallback] {label} sin stock, siguiente...")
                     errors.append(label)
                     continue
-                # Otros errores: re-lanzar
                 raise
 
         raise RuntimeError(
-            f"Ninguna de las {len(candidates)} GPUs candidatas tiene stock. "
-            f"Probadas: {', '.join(errors[:8])}{'...' if len(errors)>8 else ''}. "
-            f"Reintenta en 5-10 min."
+            f"Ninguna de las {len(candidates)} GPUs tiene stock. "
+            f"Probadas: {', '.join(errors[:8])}. Reintenta en 5-10 min."
         )
 
     @staticmethod
@@ -364,6 +328,11 @@ class RunPod:
         container_gb = container_gb or POD_CONTAINER_DISK_GB
         volume_gb = volume_gb or POD_VOLUME_DISK_GB
         # Bootstrap: instala COLMAP, gsplat, deps, baja worker.py, lo corre
+        # Bootstrap del Pod: instala TODO y arranca el worker
+        # FIX v3.5:
+        #   - --no-build-isolation para que gsplat encuentre torch
+        #   - git clone idempotente (no falla si ya existe)
+        #   - verifica torch antes de compilar gsplat
         bootstrap = (
             "bash -lc 'set -e; "
             "echo \"[bootstrap] iniciando\"; "
@@ -375,11 +344,18 @@ class RunPod:
             "pip install -q boto3 plyfile opencv-python-headless requests tqdm numpy pillow; "
             "pip install -q transformers accelerate timm safetensors huggingface_hub; "
             "echo \"[bootstrap] python deps OK\"; "
-            # gsplat v1.4.0 — la versión que SÍ funciona (sin bug color_correct)
-            "git clone --branch v1.4.0 --depth 1 "
-            "  https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
-            "cd /opt/gsplat-repo && pip install -q . && "
-            "  pip install -q -r examples/requirements.txt; "
+            # Verificar que torch existe (la imagen base de RunPod lo trae)
+            "python3 -c \"import torch; print(f\\\"[bootstrap] torch {torch.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
+            # FIX BUG 3: git clone idempotente — si ya existe, no falla
+            "if [ ! -d /opt/gsplat-repo/.git ]; then "
+            "  git clone --branch v1.4.0 --depth 1 "
+            "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
+            "else "
+            "  echo \"[bootstrap] gsplat-repo ya existe, reuso\"; "
+            "fi; "
+            # FIX BUG 1: --no-build-isolation para que gsplat ENCUENTRE torch al compilar
+            "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
+            "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
             "echo \"[bootstrap] gsplat v1.4.0 OK\"; "
             "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
             f"wget -q -O /workspace/worker.py \"{WORKER_SCRIPT_URL}\"; "
@@ -397,8 +373,8 @@ class RunPod:
         variables = {"input": {
             "cloudType":"SECURE",
             "gpuCount":1,
-            "volumeInGb": volume_gb,            # auto-ajustado a la GPU
-            "containerDiskInGb": container_gb,  # auto-ajustado a la GPU
+            "volumeInGb": volume_gb,
+            "containerDiskInGb": container_gb,
             "minVcpuCount": POD_MIN_VCPU,
             "minMemoryInGb": POD_MIN_MEMORY_GB,
             "gpuTypeId": gpu_type_id,
@@ -464,8 +440,6 @@ def health():
 
 @app.get("/api/debug/gpus")
 async def debug_gpus():
-    """Devuelve TODAS las GPUs del catálogo de RunPod y cuáles matchean
-    nuestro ranking. Útil para depurar problemas de naming."""
     all_gpus = await RunPod.list_all_gpus()
     matched = []
     for label, req, forb in GPU_PREFERENCES:
@@ -474,12 +448,11 @@ async def debug_gpus():
             name = g.get("displayName","")
             if RunPod._matches(name, req, forb):
                 found.append({"name":name, "id":g.get("id"), "vram":g.get("memoryInGb")})
-        matched.append({"label":label, "keywords":req, "forbidden":forb,
-                       "matches":found})
+        matched.append({"label":label, "matches":found})
     return {
-        "total_gpus_in_runpod": len(all_gpus),
-        "all_gpus": [{"name":g.get("displayName",""), "vram":g.get("memoryInGb",0),
-                      "id":g.get("id")} for g in all_gpus],
+        "total": len(all_gpus),
+        "all": [{"name":g.get("displayName",""), "vram":g.get("memoryInGb",0),
+                 "id":g.get("id")} for g in all_gpus],
         "ranking_matches": matched,
     }
 
@@ -508,7 +481,6 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
         job_update(job_id, status="error", error=f"R2 upload falló: {e}")
         raise HTTPException(500, f"R2 falló: {e}")
 
-    # Construir env vars del pod
     env = {
         "TOUR_ID": job_id,
         "INPUT_URL": r2_get_url(zip_key, expires=7200),
@@ -518,8 +490,6 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
         "CALLBACK_SECRET": CALLBACK_SECRET,
         "QUALITY": quality,
     }
-
-    # Recorrer el ranking de GPUs hasta encontrar una con stock (cascada automática)
     try:
         pod, gpu_label, gpu_displayname, disk = \
             await RunPod.try_create_pod_with_fallbacks(job_id, env)
