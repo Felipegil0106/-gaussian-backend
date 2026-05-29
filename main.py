@@ -349,7 +349,10 @@ class RunPod:
             "python3 -c \"import torchvision\" 2>/dev/null || "
             "  pip install -q torchvision==0.16.2 "
             "  --index-url https://download.pytorch.org/whl/cu121; "
-            "pip install -q transformers accelerate timm safetensors huggingface_hub; "
+            # FIX v3.8: transformers 4.50+ DEJÓ de soportar torch 2.1 y se auto-desactiva
+            # ('Disabling PyTorch'), causando 'name torch is not defined' en Depth/Mask2Former.
+            # 4.44.2 es la última serie que soporta torch 2.1 con Depth-Anything-V2 y Mask2Former.
+            "pip install -q \"transformers==4.44.2\" accelerate timm safetensors huggingface_hub; "
             # FIX CRÍTICO v3.7: transformers arrastra NumPy 2.x que ROMPE torch 2.1.
             # Forzamos numpy<2 al FINAL para mantener compatibilidad con torch precompilado.
             "pip install -q \"numpy<2\" --force-reinstall; "
