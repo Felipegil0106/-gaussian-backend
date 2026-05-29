@@ -369,8 +369,16 @@ class RunPod:
             "fi; "
             "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
             "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
+            # FIX v3.11: examples/requirements.txt se instala con '|| true', así que si
+            # FALLA se ignora en silencio y faltan librerías (paso 6 reventaba con
+            # 'No module named imageio'). Instalamos EXPLÍCITAMENTE lo que simple_trainer.py
+            # importa, SIN '|| true', para que un fallo real se vea en el log.
+            "pip install -q imageio imageio-ffmpeg tensorboard tyro pyyaml "
+            "  nerfview viser splines tqdm; "
             # Reforzar numpy<2 otra vez (examples/requirements puede re-instalar numpy 2)
             "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
+            # Verificar que imageio quedó importable ANTES de llegar al paso 6
+            "python3 -c \"import imageio, tyro, tensorboard; print('[bootstrap] libs gsplat OK (imageio/tyro/tensorboard)')\"; "
             # Verificar que gsplat compiló de verdad (no solo que el comando terminó)
             "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
             "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
