@@ -337,23 +337,27 @@ class RunPod:
             "bash -lc 'set -e; "
             "echo \"[bootstrap] iniciando\"; "
             "apt-get update -qq; "
+            # FIX: agregado xvfb (pantalla virtual para COLMAP headless)
             "apt-get install -y -qq git wget ffmpeg colmap python3-pip "
-            "  libgl1-mesa-glx libglib2.0-0 nodejs npm; "
-            "echo \"[bootstrap] sistema OK\"; "
+            "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb; "
+            "echo \"[bootstrap] sistema OK (con xvfb)\"; "
             "pip install -q --upgrade pip; "
             "pip install -q boto3 plyfile opencv-python-headless requests tqdm numpy pillow; "
+            # FIX: asegurar torch + torchvision (algunas imagenes no traen torchvision)
+            "python3 -c \"import torch\" 2>/dev/null || "
+            "  pip install -q torch==2.1.2 torchvision==0.16.2 "
+            "  --index-url https://download.pytorch.org/whl/cu121; "
+            "python3 -c \"import torchvision\" 2>/dev/null || "
+            "  pip install -q torchvision==0.16.2 "
+            "  --index-url https://download.pytorch.org/whl/cu121; "
             "pip install -q transformers accelerate timm safetensors huggingface_hub; "
             "echo \"[bootstrap] python deps OK\"; "
-            # Verificar que torch existe (la imagen base de RunPod lo trae)
-            "python3 -c \"import torch; print(f\\\"[bootstrap] torch {torch.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
-            # FIX BUG 3: git clone idempotente — si ya existe, no falla
+            "python3 -c \"import torch, torchvision; print(f\\\"[bootstrap] torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
+            # git clone idempotente
             "if [ ! -d /opt/gsplat-repo/.git ]; then "
             "  git clone --branch v1.4.0 --depth 1 "
             "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
-            "else "
-            "  echo \"[bootstrap] gsplat-repo ya existe, reuso\"; "
-            "fi; "
-            # FIX BUG 1: --no-build-isolation para que gsplat ENCUENTRE torch al compilar
+            "else echo \"[bootstrap] gsplat-repo ya existe\"; fi; "
             "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
             "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
             "echo \"[bootstrap] gsplat v1.4.0 OK\"; "
