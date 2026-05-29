@@ -377,8 +377,12 @@ class RunPod:
             "  nerfview viser splines tqdm; "
             # Reforzar numpy<2 otra vez (examples/requirements puede re-instalar numpy 2)
             "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-            # Verificar que imageio quedó importable ANTES de llegar al paso 6
-            "python3 -c \"import imageio, tyro, tensorboard; print('[bootstrap] libs gsplat OK (imageio/tyro/tensorboard)')\"; "
+            # Verificar que imageio quedó importable ANTES de llegar al paso 6.
+            # OJO: todo el bootstrap va en bash -lc '...', así que aquí NO se pueden
+            # usar comillas simples (cerrarían el bloque). Solo comillas dobles escapadas.
+            "python3 -c \"import imageio, tyro, tensorboard\" "
+            "  && echo \"[bootstrap] libs gsplat OK\" "
+            "  || echo \"[bootstrap] WARN: falta alguna lib de gsplat\"; "
             # Verificar que gsplat compiló de verdad (no solo que el comando terminó)
             "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
             "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
