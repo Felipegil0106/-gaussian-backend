@@ -41,8 +41,9 @@ import uvicorn
 RUNPOD_API_KEY      = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_API_URL      = "https://api.runpod.io/graphql"
 
-# Imagen base PyTorch+CUDA compatible con gsplat 1.4.0
-RUNPOD_IMAGE        = "runpod/pytorch:2.1.1-py3.10-cuda12.1.1-devel-ubuntu22.04"
+# Imagen PROPIA con COLMAP + OpenMVS precompilados (para generar malla).
+# Construida con GitHub Actions y subida a Docker Hub.
+RUNPOD_IMAGE        = "felipegil0106/gaussian-mesh:v1"
 
 # Configuración del Pod (LO QUE PEDISTE: cont 50, vol 100)
 POD_CONTAINER_DISK_GB = 50
@@ -94,9 +95,8 @@ BANNED_GPU_KEYWORDS = [
 #   3) RunPod segunda mejor opción (RTX 6000 Ada, L40S, ...)
 VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
 VAST_API_URL = "https://console.vast.ai/api/v0"
-# En Vast usamos una imagen oficial de PyTorch+CUDA equivalente a la de RunPod,
-# para que el MISMO bootstrap funcione igual (gsplat 1.4.0 necesita CUDA 12.1 devel).
-VAST_IMAGE = "pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel"
+# En Vast usamos LA MISMA imagen propia que en RunPod (ya trae COLMAP+OpenMVS+CUDA).
+VAST_IMAGE = "felipegil0106/gaussian-mesh:v1"
 # Filtros para que Vast solo alquile máquinas SANAS y de verdad RTX 4090:
 VAST_MIN_DISK_GB    = 80      # disco mínimo en la máquina alquilada
 VAST_MIN_RELIABILITY = 0.95   # fiabilidad mínima del host (0-1); evita máquinas malas
@@ -172,7 +172,8 @@ def init_db():
         # Migraciones idempotentes
         for col, typ in [("pod_id","TEXT"),("gpu_type","TEXT"),
                          ("last_heartbeat","TEXT"),("progress","REAL"),
-                         ("message","TEXT"),("worker_log","TEXT")]:
+                         ("message","TEXT"),("worker_log","TEXT"),
+                         ("glb_mb","REAL")]:
             try: db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError: pass
 
@@ -228,79 +229,31 @@ def r2_upload_file(file_obj, key):
 # ══════════════════════════════════════════════════════════════
 
 def build_bootstrap(wrap_bash_lc: bool = True) -> str:
-    """Devuelve el comando de arranque que instala TODO y corre el worker.
+    """Devuelve el comando de arranque del pod.
 
-    Es EXACTAMENTE el mismo para RunPod y Vast — así un solo cambio aquí
-    arregla los dos sitios y nunca se desincronizan.
+    Con la imagen propia 'gaussian-mesh:v1' (COLMAP + OpenMVS + Python ya
+    instalados), el bootstrap es MÍNIMO: solo descarga el worker y lo corre.
+    Ya NO compilamos nada (eso se hizo una vez al construir la imagen),
+    así que el arranque pasa de ~10 min a ~30 segundos.
+
+    Es EXACTAMENTE el mismo para RunPod y Vast.
 
     wrap_bash_lc=True  → envuelto en  bash -lc '...'  (RunPod 'dockerArgs').
-    wrap_bash_lc=False → cuerpo desnudo, sin comillas externas (Vast 'onstart',
-                         que ya se ejecuta dentro de bash).
+    wrap_bash_lc=False → cuerpo desnudo, sin comillas externas (Vast 'onstart').
     """
     # OJO: si wrap_bash_lc=True, todo va dentro de comillas SIMPLES, así que
     # dentro NUNCA se pueden usar comillas simples (cerrarían el bloque).
     body = (
         "set -e; "
-        "echo \"[bootstrap] iniciando\"; "
-        "apt-get update -qq; "
-        "apt-get install -y -qq git wget ffmpeg colmap python3-pip "
-        "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb ninja-build; "
-        "echo \"[bootstrap] sistema OK (con xvfb + ninja)\"; "
-        "pip install -q --upgrade pip; "
-        "pip install -q boto3 plyfile opencv-python-headless requests tqdm pillow; "
-        # torch/torchvision (la imagen base los trae, pero por si acaso)
-        "python3 -c \"import torch\" 2>/dev/null || "
-        "  pip install -q torch==2.1.2 torchvision==0.16.2 "
-        "  --index-url https://download.pytorch.org/whl/cu121; "
-        "python3 -c \"import torchvision\" 2>/dev/null || "
-        "  pip install -q torchvision==0.16.2 "
-        "  --index-url https://download.pytorch.org/whl/cu121; "
-        # FIX v3.8: transformers 4.50+ DEJÓ de soportar torch 2.1 y se auto-desactiva
-        # ('Disabling PyTorch'), causando 'name torch is not defined' en Depth/Mask2Former.
-        "pip install -q \"transformers==4.44.2\" accelerate timm safetensors huggingface_hub scipy; "
-        # FIX CRÍTICO v3.7: transformers arrastra NumPy 2.x que ROMPE torch 2.1.
-        "pip install -q \"numpy<2\" --force-reinstall; "
-        "echo \"[bootstrap] python deps OK (numpy<2 forzado)\"; "
-        "python3 -c \"import numpy, torch, torchvision; print(f\\\"[bootstrap] numpy {numpy.__version__} torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
-        # FIX CRÍTICO v3.7: --recursive trae el submódulo glm (glm/glm.hpp que faltaba).
-        "if [ ! -d /opt/gsplat-repo/.git ]; then "
-        "  git clone --recursive --branch v1.4.0 --depth 1 "
-        "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
-        "else "
-        "  echo \"[bootstrap] gsplat-repo existe, actualizando submódulos\"; "
-        "  cd /opt/gsplat-repo && git submodule update --init --recursive; "
-        "fi; "
-        "cd /opt/gsplat-repo && pip install -q --no-build-isolation . ; "
-        # FIX v3.15: NO usamos un pip install a mano adivinando paquetes. El requirements.txt
-        # oficial de gsplat v1.4.0 pide un pycolmap ESPECÍFICO de GitHub (rmbrualla) que SÍ
-        # tiene la clase SceneManager; el 'pycolmap' de PyPI es OTRA librería que NO la tiene.
-        # Instalamos las dependencias oficiales una por una para que un fallo se vea en el log.
-        "echo \"[bootstrap] instalando deps oficiales de gsplat (incluye pycolmap correcto)...\"; "
-        "pip install -q \"git+https://github.com/rmbrualla/pycolmap@cc7ea4b7301720ac29287dbe450952511b32125e\"; "
-        "pip install -q viser \"nerfview==0.0.2\" \"imageio[ffmpeg]\" scikit-learn tqdm "
-        "  \"torchmetrics[image]\" opencv-python-headless \"tyro>=0.8.8\" Pillow "
-        "  tensorboard tensorly pyyaml matplotlib; "
-        # FIX v3.16: fused-ssim NO es opcional (simple_trainer.py lo importa obligatorio en
-        # la línea 28). Se COMPILA con CUDA, así que necesita --no-build-isolation igual que
-        # gsplat (sin eso no encuentra torch y falla). Mostramos el error si pasa (sin 2>/dev/null)
-        # para no volver a tener una compilación que falla en silencio.
-        "echo \"[bootstrap] compilando fused-ssim (CUDA, puede tardar 1-3 min)...\"; "
-        "pip install --no-build-isolation \"git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157\" "
-        "  && echo \"[bootstrap] fused-ssim OK\" "
-        "  || echo \"[bootstrap] ERROR: fused-ssim NO compiló (gsplat lo necesita)\"; "
-        # numpy<2 al final (varias de las de arriba intentan subir a numpy 2)
-        "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-        # FIX v3.15/16: la verificación importa datasets.colmap, SceneManager Y fused_ssim
-        # (lo que de verdad usa simple_trainer.py). Así detectamos cualquier falta en el
-        # bootstrap (~6 min) en vez de a los 18 min. OJO: bash -lc '...' → NADA de comillas simples.
-        "echo \"[bootstrap] probando imports de simple_trainer.py...\"; "
-        "cd /opt/gsplat-repo/examples && python3 -c \"from datasets.colmap import Dataset, Parser; from pycolmap import SceneManager; from fused_ssim import fused_ssim; import imageio, tyro, tensorboard, nerfview, matplotlib; print(\\\"[bootstrap] imports de gsplat OK (cadena completa: SceneManager + fused_ssim)\\\")\" "
-        "  || echo \"[bootstrap] WARN: aun falta alguna lib para simple_trainer.py (mira arriba)\"; "
-        "cd /opt/gsplat-repo; "
-        "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
-        "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
-        "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
-        # En Vast el directorio de trabajo es /workspace igual que en RunPod
+        "echo \"[bootstrap] iniciando (imagen con OpenMVS precompilado)\"; "
+        # Verificación rápida de que la imagen trae lo que esperamos.
+        "echo \"[bootstrap] verificando herramientas...\"; "
+        "which colmap && echo \"[bootstrap] colmap OK\" || echo \"[bootstrap] WARN: falta colmap\"; "
+        "ls /usr/local/bin/OpenMVS/ 2>/dev/null && echo \"[bootstrap] OpenMVS OK\" || echo \"[bootstrap] WARN: falta OpenMVS\"; "
+        "python3 -c \"import boto3, trimesh, numpy, cv2; print(\\\"[bootstrap] python deps OK\\\")\" || echo \"[bootstrap] WARN: falta alguna lib python\"; "
+        # Asegurar PATH de OpenMVS (la imagen ya lo pone, pero por si acaso).
+        "export PATH=/usr/local/bin/OpenMVS:$PATH; "
+        # Descargar el worker más reciente y ejecutarlo.
         "mkdir -p /workspace; "
         f"wget -q -O /workspace/worker.py \"{WORKER_SCRIPT_URL}\"; "
         "echo \"[bootstrap] worker descargado, ejecutando\"; "
@@ -789,7 +742,7 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
     now = datetime.now(timezone.utc).isoformat()
     zip_key = f"uploads/{job_id}/input.zip"
     ply_key = f"results/{job_id}/scene.ply"
-    glb_key = f"results/{job_id}/collision.glb"
+    glb_key = f"results/{job_id}/scene.glb"
 
     with get_db() as db:
         db.execute("""
@@ -858,10 +811,19 @@ def download_result(job_id: str):
     if not j: raise HTTPException(404, "Job no encontrado")
     if j["status"] != "completed":
         raise HTTPException(400, f"Job no listo (estado: {j['status']})")
-    result = {"job_id":job_id, "ply_url":r2_get_url(j["ply_key"]),
-              "ply_mb":j.get("ply_mb",0)}
-    if j.get("has_collision"):
-        result["glb_url"] = r2_get_url(j["glb_key"])
+    # El entregable principal ahora es la MALLA (.glb).
+    result = {
+        "job_id": job_id,
+        "glb_url": r2_get_url(j["glb_key"]),     # la malla texturizada
+        "glb_mb": j.get("glb_mb", 0),
+    }
+    # Compatibilidad: si existiera un .ply (modo splat antiguo), también lo damos.
+    try:
+        if j.get("ply_key"):
+            result["ply_url"] = r2_get_url(j["ply_key"])
+            result["ply_mb"] = j.get("ply_mb", 0)
+    except Exception:
+        pass
     return result
 
 @app.get("/api/jobs/{job_id}/log", response_class=PlainTextResponse)
@@ -911,6 +873,7 @@ async def worker_callback(job_id: str, request: Request,
                    progress=1.0,
                    message="Completado",
                    frames_used=payload.get("frames_used", 0),
+                   glb_mb=payload.get("glb_mb", 0),
                    ply_mb=payload.get("ply_mb", 0),
                    has_collision=1 if payload.get("has_collision") else 0,
                    seconds=payload.get("seconds", 0),
