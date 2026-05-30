@@ -270,23 +270,24 @@ def build_bootstrap(wrap_bash_lc: bool = True) -> str:
         "  echo \"[bootstrap] gsplat-repo existe, actualizando submódulos\"; "
         "  cd /opt/gsplat-repo && git submodule update --init --recursive; "
         "fi; "
-        "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
-        "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
-        # FIX v3.11: instalamos EXPLÍCITAMENTE lo que simple_trainer.py importa.
-        # FIX v3.13: nerfview importa matplotlib por dentro, y viser arrastra otras.
-        # FIX v3.14: simple_trainer.py también importa pycolmap (lee la salida de COLMAP).
-        # Listamos toda la cadena de una vez para no ir cazando un import por corrida.
-        "pip install -q imageio imageio-ffmpeg tensorboard tyro pyyaml "
-        "  nerfview viser splines tqdm matplotlib pycolmap "
-        "  scikit-learn opencv-python-headless plotly pillow; "
+        "cd /opt/gsplat-repo && pip install -q --no-build-isolation . ; "
+        # FIX v3.15: NO usamos un pip install a mano adivinando paquetes. El requirements.txt
+        # oficial de gsplat v1.4.0 pide un pycolmap ESPECÍFICO de GitHub (rmbrualla) que SÍ
+        # tiene la clase SceneManager; el 'pycolmap' de PyPI es OTRA librería que NO la tiene.
+        # Instalamos las dependencias oficiales una por una para que un fallo se vea en el log.
+        "echo \"[bootstrap] instalando deps oficiales de gsplat (incluye pycolmap correcto)...\"; "
+        "pip install -q \"git+https://github.com/rmbrualla/pycolmap@cc7ea4b7301720ac29287dbe450952511b32125e\"; "
+        "pip install -q viser \"nerfview==0.0.2\" \"imageio[ffmpeg]\" scikit-learn tqdm "
+        "  \"torchmetrics[image]\" opencv-python-headless \"tyro>=0.8.8\" Pillow "
+        "  tensorboard tensorly pyyaml matplotlib; "
+        "pip install -q \"git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157\" 2>/dev/null || echo \"[bootstrap] WARN fused-ssim no compiló (gsplat puede correr sin él)\"; "
+        # numpy<2 al final (varias de las de arriba intentan subir a numpy 2)
         "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-        # FIX v3.14: en vez de adivinar imports uno por uno, intentamos IMPORTAR DE VERDAD
-        # las librerías que usa simple_trainer.py durante el bootstrap. Si falta CUALQUIERA,
-        # sale aquí (bootstrap ~5 min) y no después de 18 min de render.
-        # OJO: todo va en bash -lc '...', así que NO se pueden usar comillas simples aquí;
-        # solo comillas dobles escapadas (\").
+        # FIX v3.15: la verificación ahora importa datasets.colmap (lo que de verdad usa
+        # simple_trainer.py). Así detectamos un pycolmap equivocado en el bootstrap (~5 min)
+        # en vez de a los 18 min. OJO: bash -lc '...' → NADA de comillas simples aquí.
         "echo \"[bootstrap] probando imports de simple_trainer.py...\"; "
-        "cd /opt/gsplat-repo/examples && python3 -c \"import datasets.colmap, imageio, tyro, tensorboard, nerfview, matplotlib, pycolmap; print(\\\"[bootstrap] imports de gsplat OK (cadena completa)\\\")\" "
+        "cd /opt/gsplat-repo/examples && python3 -c \"from datasets.colmap import Dataset, Parser; from pycolmap import SceneManager; import imageio, tyro, tensorboard, nerfview, matplotlib; print(\\\"[bootstrap] imports de gsplat OK (cadena completa, SceneManager incluido)\\\")\" "
         "  || echo \"[bootstrap] WARN: aun falta alguna lib para simple_trainer.py (mira arriba)\"; "
         "cd /opt/gsplat-repo; "
         "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
