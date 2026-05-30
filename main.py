@@ -740,6 +740,9 @@ async def worker_callback(job_id: str, request: Request,
         return {"ok":True}
 
     elif cb_type == "completed":
+        # Guardar el log TAMBIÉN en éxito (antes solo se guardaba en error).
+        # Así se puede revisar el log aunque la GPU ya se haya apagado.
+        log_text = payload.get("log", "") or "(El render terminó bien; sin log detallado)"
         job_update(job_id,
                    status="completed",
                    progress=1.0,
@@ -749,8 +752,9 @@ async def worker_callback(job_id: str, request: Request,
                    ply_mb=payload.get("ply_mb", 0),
                    has_collision=1 if payload.get("has_collision") else 0,
                    seconds=payload.get("seconds", 0),
+                   worker_log=log_text,
                    last_heartbeat=now)
-        # TERMINAR EL POD (clave: no dejar GPU cobrando) — RunPod o Vast
+        # TERMINAR EL POD (clave: no dejar GPU cobrando)
         if j.get("pod_id"):
             await terminate_any(j["pod_id"])
         return {"ok":True}
