@@ -280,14 +280,21 @@ def build_bootstrap(wrap_bash_lc: bool = True) -> str:
         "pip install -q viser \"nerfview==0.0.2\" \"imageio[ffmpeg]\" scikit-learn tqdm "
         "  \"torchmetrics[image]\" opencv-python-headless \"tyro>=0.8.8\" Pillow "
         "  tensorboard tensorly pyyaml matplotlib; "
-        "pip install -q \"git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157\" 2>/dev/null || echo \"[bootstrap] WARN fused-ssim no compiló (gsplat puede correr sin él)\"; "
+        # FIX v3.16: fused-ssim NO es opcional (simple_trainer.py lo importa obligatorio en
+        # la línea 28). Se COMPILA con CUDA, así que necesita --no-build-isolation igual que
+        # gsplat (sin eso no encuentra torch y falla). Mostramos el error si pasa (sin 2>/dev/null)
+        # para no volver a tener una compilación que falla en silencio.
+        "echo \"[bootstrap] compilando fused-ssim (CUDA, puede tardar 1-3 min)...\"; "
+        "pip install --no-build-isolation \"git+https://github.com/rahul-goel/fused-ssim@1272e21a282342e89537159e4bad508b19b34157\" "
+        "  && echo \"[bootstrap] fused-ssim OK\" "
+        "  || echo \"[bootstrap] ERROR: fused-ssim NO compiló (gsplat lo necesita)\"; "
         # numpy<2 al final (varias de las de arriba intentan subir a numpy 2)
         "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-        # FIX v3.15: la verificación ahora importa datasets.colmap (lo que de verdad usa
-        # simple_trainer.py). Así detectamos un pycolmap equivocado en el bootstrap (~5 min)
-        # en vez de a los 18 min. OJO: bash -lc '...' → NADA de comillas simples aquí.
+        # FIX v3.15/16: la verificación importa datasets.colmap, SceneManager Y fused_ssim
+        # (lo que de verdad usa simple_trainer.py). Así detectamos cualquier falta en el
+        # bootstrap (~6 min) en vez de a los 18 min. OJO: bash -lc '...' → NADA de comillas simples.
         "echo \"[bootstrap] probando imports de simple_trainer.py...\"; "
-        "cd /opt/gsplat-repo/examples && python3 -c \"from datasets.colmap import Dataset, Parser; from pycolmap import SceneManager; import imageio, tyro, tensorboard, nerfview, matplotlib; print(\\\"[bootstrap] imports de gsplat OK (cadena completa, SceneManager incluido)\\\")\" "
+        "cd /opt/gsplat-repo/examples && python3 -c \"from datasets.colmap import Dataset, Parser; from pycolmap import SceneManager; from fused_ssim import fused_ssim; import imageio, tyro, tensorboard, nerfview, matplotlib; print(\\\"[bootstrap] imports de gsplat OK (cadena completa: SceneManager + fused_ssim)\\\")\" "
         "  || echo \"[bootstrap] WARN: aun falta alguna lib para simple_trainer.py (mira arriba)\"; "
         "cd /opt/gsplat-repo; "
         "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
