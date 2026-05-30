@@ -88,19 +88,10 @@ BANNED_GPU_KEYWORDS = [
     "5090", "rtx pro", "b200", "b300", "h100", "h200",
 ]
 
-# ── VAST.AI (segunda fuente de GPU, solo para la RTX 4090 más barata) ──
-# Flujo de alquiler (lo que pediste):
+# ── JERARQUÍA DE ALQUILER (solo RunPod) ──
 #   1) RunPod RTX 4090  → si no hay:
-#   2) Vast.ai RTX 4090 MÁS BARATA  → si no hay:
-#   3) RunPod segunda mejor opción (RTX 6000 Ada, L40S, ...)
-VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
-VAST_API_URL = "https://cloud.vast.ai/api/v0"
-# En Vast usamos LA MISMA imagen propia que en RunPod (ya trae COLMAP+OpenMVS+CUDA).
-VAST_IMAGE = "felipegil0106/gaussian-mesh:v1"
-# Filtros para que Vast solo alquile máquinas SANAS y de verdad RTX 4090:
-VAST_MIN_DISK_GB    = 80      # disco mínimo en la máquina alquilada
-VAST_MIN_RELIABILITY = 0.95   # fiabilidad mínima del host (0-1); evita máquinas malas
-VAST_MIN_INET_DOWN  = 100.0   # Mbps mínimos de bajada (para descargar el ZIP rápido)
+#   2) RunPod segunda mejor opción (RTX 6000 Ada, L40S, A100, ...)
+# (Vast.ai fue retirado del proyecto.)
 
 # URL pública del worker.py en GitHub (lo que el pod baja al arrancar)
 WORKER_SCRIPT_URL   = os.environ.get(
@@ -225,7 +216,7 @@ def r2_upload_file(file_obj, key):
     get_r2().upload_fileobj(file_obj, R2_BUCKET, key)
 
 # ══════════════════════════════════════════════════════════════
-# BOOTSTRAP COMPARTIDO (lo corren igual RunPod y Vast.ai)
+# BOOTSTRAP del pod (RunPod)
 # ══════════════════════════════════════════════════════════════
 
 def build_bootstrap(wrap_bash_lc: bool = True) -> str:
@@ -236,10 +227,10 @@ def build_bootstrap(wrap_bash_lc: bool = True) -> str:
     Ya NO compilamos nada (eso se hizo una vez al construir la imagen),
     así que el arranque pasa de ~10 min a ~30 segundos.
 
-    Es EXACTAMENTE el mismo para RunPod y Vast.
+    Lo ejecuta el pod de RunPod al arrancar.
 
     wrap_bash_lc=True  → envuelto en  bash -lc '...'  (RunPod 'dockerArgs').
-    wrap_bash_lc=False → cuerpo desnudo, sin comillas externas (Vast 'onstart').
+    wrap_bash_lc=False → cuerpo desnudo (no usado actualmente).
     """
     # OJO: si wrap_bash_lc=True, todo va dentro de comillas SIMPLES, así que
     # dentro NUNCA se pueden usar comillas simples (cerrarían el bloque).
@@ -383,7 +374,7 @@ class RunPod:
         """Crea un Pod on-demand. Bootstrap descarga worker.py y lo ejecuta."""
         container_gb = container_gb or POD_CONTAINER_DISK_GB
         volume_gb = volume_gb or POD_VOLUME_DISK_GB
-        # El bootstrap es COMPARTIDO con Vast.ai (misma instalación, mismo worker).
+        # El bootstrap instala y corre el worker en el pod de RunPod.
         bootstrap = build_bootstrap()
         env_list = [{"key":k, "value":str(v)} for k, v in env_vars.items()]
         mutation = """
@@ -439,122 +430,18 @@ class RunPod:
             return []
 
 # ══════════════════════════════════════════════════════════════
-# VAST.AI (API REST) — solo para la RTX 4090 MÁS BARATA
+# VAST.AI — RETIRADO
 # ══════════════════════════════════════════════════════════════
-
-class Vast:
-    """Cliente mínimo de Vast.ai. Misma idea que RunPod pero API REST.
-
-    En Vast el flujo es:
-      1) GET  /bundles   → lista ofertas (máquinas disponibles) con su precio
-      2) ordenamos por precio total $/hora y elegimos la más barata
-      3) PUT  /asks/{id}/ → crea la instancia con nuestra imagen + onstart
-    El onstart corre el MISMO bootstrap que RunPod.
-    """
-
-    @staticmethod
-    async def _request(method, path, json_body=None, params=None):
-        headers = {"Authorization": f"Bearer {VAST_API_KEY}",
-                   "Content-Type": "application/json"}
-        url = f"{VAST_API_URL}{path}"
-        # follow_redirects=True: si Vast mueve su API (301/302), seguimos el
-        # redirect en vez de fallar. Esto nos protege de futuros cambios de URL.
-        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
-            r = await c.request(method, url, headers=headers,
-                                json=json_body, params=params)
-            r.raise_for_status()
-            if r.text.strip():
-                return r.json()
-            return {}
-
-    @staticmethod
-    async def find_cheapest_4090():
-        """Busca la RTX 4090 más barata, sana y disponible. Devuelve la oferta o None."""
-        # Filtro que entiende Vast: GPU rentable, nombre 4090, 1 sola GPU,
-        # disco/fiabilidad/red mínimos. El resto lo ordenamos nosotros por precio.
-        query = {
-            "verified": {"eq": True},
-            "rentable": {"eq": True},
-            "num_gpus": {"eq": 1},
-            "gpu_name": {"eq": "RTX 4090"},
-            "disk_space": {"gte": VAST_MIN_DISK_GB},
-            "reliability2": {"gte": VAST_MIN_RELIABILITY},
-            "inet_down": {"gte": VAST_MIN_INET_DOWN},
-            "rented": {"eq": False},
-            "order": [["dph_total", "asc"]],   # dph_total = dólares por hora, ascendente
-            "type": "on-demand",
-        }
-        try:
-            data = await Vast._request("GET", "/bundles",
-                                       params={"q": json.dumps(query)})
-        except Exception as e:
-            print(f"[vast] búsqueda falló: {e}")
-            return None
-        offers = data.get("offers", []) or []
-        if not offers:
-            print("[vast] no hay RTX 4090 disponibles ahora")
-            return None
-        # Ya viene ordenado por precio, pero re-ordenamos por seguridad
-        offers.sort(key=lambda o: o.get("dph_total", 9e9))
-        best = offers[0]
-        print(f"[vast] 4090 más barata: id={best.get('id')} "
-              f"${best.get('dph_total'):.3f}/h  host_rel={best.get('reliability2')}")
-        return best
-
-    @staticmethod
-    async def create_instance(job_id, offer_id, env_vars):
-        """Crea (alquila) la instancia Vast con el bootstrap compartido."""
-        # Vast inyecta variables con -e en el docker; las pasamos en 'env'.
-        # El onstart corre en bash, así que NO usamos el wrapper bash -lc.
-        onstart = build_bootstrap(wrap_bash_lc=False)
-        body = {
-            "client_id": "me",
-            "image": VAST_IMAGE,
-            "disk": float(max(VAST_MIN_DISK_GB, POD_CONTAINER_DISK_GB)),
-            "label": f"gaussian-{job_id[:8]}",
-            "onstart": onstart,
-            "env": {k: str(v) for k, v in env_vars.items()},
-            # runtype "ssh args": "args" hace que Vast EJECUTE el onstart
-            # automáticamente al arrancar (sin esperar conexión manual);
-            # "ssh" deja acceso SSH disponible por si hay que depurar.
-            # Con solo "ssh" el worker no corría solo (se quedaba esperando).
-            "runtype": "ssh args",
-        }
-        print(f"[vast] alquilando instancia sobre oferta {offer_id}")
-        data = await Vast._request("PUT", f"/asks/{offer_id}/", json_body=body)
-        # Vast devuelve {'success': True, 'new_contract': <instance_id>}
-        if not data.get("success"):
-            raise RuntimeError(f"Vast rechazó la creación: {data}")
-        instance_id = data.get("new_contract")
-        print(f"[vast] ✓ instancia creada: {instance_id}")
-        return {"id": str(instance_id)}
-
-    @staticmethod
-    async def terminate_instance(instance_id):
-        """Destruye la instancia Vast (deja de cobrar)."""
-        if not instance_id:
-            return False
-        try:
-            await Vast._request("DELETE", f"/instances/{instance_id}/")
-            print(f"[vast] instancia {instance_id} terminada")
-            return True
-        except Exception as e:
-            print(f"[vast] terminate falló: {e}")
-            return False
-
-    @staticmethod
-    async def list_my_instances():
-        try:
-            data = await Vast._request("GET", "/instances/")
-            return data.get("instances", []) or []
-        except Exception:
-            return []
+# Vast.ai fue retirado del proyecto. Solo se usa RunPod.
+# Motivo: las máquinas de Vast tardaban mucho descargando la imagen
+# (varios GB) en cada alquiler, generando esperas largas y costo
+# mientras no trabajaban. RunPod cachea mejor las imágenes.
 
 
 # ══════════════════════════════════════════════════════════════
 # PROVISIÓN DE GPU — la cascada que pediste
 #   1) RunPod RTX 4090
-#   2) Vast.ai RTX 4090 más barata
+#   2) RunPod segunda mejor opción
 #   3) RunPod segunda mejor opción (resto del ranking)
 # ══════════════════════════════════════════════════════════════
 
@@ -641,7 +528,8 @@ async def _runpod_create_second_best(job_id, env_vars):
 async def provision_gpu(job_id, env_vars):
     """Cascada de alquiler. Devuelve (pod_tagged_id, provider, gpu_label, gpu_display, disk).
 
-    pod_tagged_id ya viene con prefijo 'runpod:' o 'vast:' para el watchdog.
+    pod_tagged_id ya viene con prefijo 'runpod:' para el watchdog.
+    Solo usa RunPod (Vast fue retirado).
     """
     steps_failed = []
 
@@ -656,45 +544,24 @@ async def provision_gpu(job_id, env_vars):
     else:
         print("[cascada-1] RUNPOD_API_KEY no configurada, salto paso 1")
 
-    # ── PASO 2: Vast.ai RTX 4090 más barata ──
-    if VAST_API_KEY:
-        try:
-            offer = await Vast.find_cheapest_4090()
-            if offer:
-                inst = await Vast.create_instance(job_id, offer.get("id"), env_vars)
-                disk = {"container": int(max(VAST_MIN_DISK_GB, POD_CONTAINER_DISK_GB)),
-                        "volume": 0}
-                price = offer.get("dph_total", 0)
-                disp = f"RTX 4090 (Vast ${price:.3f}/h)"
-                return _tag_pod("vast", inst.get("id", "")), "vast", "RTX 4090 (Vast)", disp, disk
-            else:
-                steps_failed.append("Vast 4090 (sin stock)")
-        except Exception as e:
-            print(f"[cascada-2] Vast falló: {e}")
-            steps_failed.append("Vast 4090 (error)")
-    else:
-        print("[cascada-2] VAST_API_KEY no configurada, salto paso 2")
-
-    # ── PASO 3: RunPod segunda mejor opción ──
+    # ── PASO 2: RunPod segunda mejor opción ──
     if RUNPOD_API_KEY:
         try:
             pod, label, disp, disk = await _runpod_create_second_best(job_id, env_vars)
             return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
         except Exception as e:
-            print(f"[cascada-3] RunPod 2ª opción falló: {e}")
+            print(f"[cascada-2] RunPod 2ª opción falló: {e}")
             steps_failed.append("RunPod 2ª opción")
 
     raise RuntimeError(
-        "No se pudo alquilar GPU en ninguna fuente. "
+        "No se pudo alquilar GPU en RunPod. "
         f"Intentado: {', '.join(steps_failed)}. Reintenta en 5-10 min."
     )
 
 
 async def terminate_any(pod_tagged_id):
-    """Termina un pod/instancia sin importar la fuente (lee el prefijo)."""
+    """Termina un pod de RunPod (lee el prefijo)."""
     provider, pid = _split_pod_tag(pod_tagged_id)
-    if provider == "vast":
-        return await Vast.terminate_instance(pid)
     return await RunPod.terminate_pod(pid)
 
 # ══════════════════════════════════════════════════════════════
@@ -718,7 +585,6 @@ def index():
 def health():
     return {"status":"ok", "time":datetime.now(timezone.utc).isoformat(),
             "runpod_configured": bool(RUNPOD_API_KEY),
-            "vast_configured": bool(VAST_API_KEY),
             "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY)}
 
 @app.get("/api/debug/gpus")
@@ -936,14 +802,14 @@ async def _watchdog_pass():
             job_update(r["id"], status="error",
                        error=f"Sin heartbeat hace {age_min:.0f} min (timeout)")
 
-    # 2) Pods/instancias que NO están en nuestra DB → huérfanos, matar
-    known_runpod, known_vast = set(), set()
+    # 2) Pods que NO están en nuestra DB → huérfanos, matar
+    known_runpod = set()
     with get_db() as db:
         for r in db.execute("SELECT pod_id FROM jobs WHERE pod_id IS NOT NULL").fetchall():
             prov, pid = _split_pod_tag(r["pod_id"])
             if not pid:
                 continue
-            (known_vast if prov == "vast" else known_runpod).add(pid)
+            known_runpod.add(pid)
 
     # 2a) Huérfanos en RunPod
     try:
@@ -958,20 +824,6 @@ async def _watchdog_pass():
                 print(f"[watchdog] Pod RunPod huérfano {pid} con {uptime}s — terminando")
                 await RunPod.terminate_pod(pid)
 
-    # 2b) Huérfanos en Vast
-    if VAST_API_KEY:
-        try:
-            insts = await Vast.list_my_instances()
-        except Exception:
-            insts = []
-        for ins in insts:
-            iid = str(ins.get("id", ""))
-            if iid and iid not in known_vast:
-                uptime = ins.get("duration", 0) or 0  # segundos corriendo
-                if uptime and uptime > POD_MAX_LIFETIME_MIN * 60:
-                    print(f"[watchdog] Instancia Vast huérfana {iid} con {uptime}s — terminando")
-                    await Vast.terminate_instance(iid)
-
 # ══════════════════════════════════════════════════════════════
 # STARTUP
 # ══════════════════════════════════════════════════════════════
@@ -980,8 +832,7 @@ async def _watchdog_pass():
 async def startup():
     init_db()
     asyncio.create_task(watchdog_loop())
-    print(f"Backend v3 iniciado. RunPod={'OK' if RUNPOD_API_KEY else 'NO'}, "
-          f"Vast={'OK' if VAST_API_KEY else 'NO'}, "
+    print(f"Backend v4 iniciado (solo RunPod). RunPod={'OK' if RUNPOD_API_KEY else 'NO'}, "
           f"R2={'OK' if R2_ACCOUNT_ID else 'NO'}, BACKEND_URL={BACKEND_URL}")
 
 # ══════════════════════════════════════════════════════════════
