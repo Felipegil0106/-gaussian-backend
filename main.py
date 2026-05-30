@@ -94,7 +94,7 @@ BANNED_GPU_KEYWORDS = [
 #   2) Vast.ai RTX 4090 MÁS BARATA  → si no hay:
 #   3) RunPod segunda mejor opción (RTX 6000 Ada, L40S, ...)
 VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
-VAST_API_URL = "https://console.vast.ai/api/v0"
+VAST_API_URL = "https://cloud.vast.ai/api/v0"
 # En Vast usamos LA MISMA imagen propia que en RunPod (ya trae COLMAP+OpenMVS+CUDA).
 VAST_IMAGE = "felipegil0106/gaussian-mesh:v1"
 # Filtros para que Vast solo alquile máquinas SANAS y de verdad RTX 4090:
@@ -457,7 +457,9 @@ class Vast:
         headers = {"Authorization": f"Bearer {VAST_API_KEY}",
                    "Content-Type": "application/json"}
         url = f"{VAST_API_URL}{path}"
-        async with httpx.AsyncClient(timeout=40) as c:
+        # follow_redirects=True: si Vast mueve su API (301/302), seguimos el
+        # redirect en vez de fallar. Esto nos protege de futuros cambios de URL.
+        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as c:
             r = await c.request(method, url, headers=headers,
                                 json=json_body, params=params)
             r.raise_for_status()
@@ -1044,7 +1046,7 @@ select{background:#2a2a2a;color:#eee}
     <div class="bar"><div class="bar-fill" id="barFill" style="width:0%"></div></div>
     <div class="log-box" id="logBox">Iniciando...</div>
     <div id="resultActions" class="hidden">
-      <button class="btn-success hidden" id="viewBtn">🎨 Descargar .ply</button>
+      <button class="btn-success hidden" id="viewBtn">🎨 Descargar malla (.glb)</button>
       <button class="btn-download hidden" id="logBtn">📄 Descargar log del error</button>
       <button class="btn-primary" id="newBtn">🔄 Probar otro ZIP</button>
     </div>
@@ -1088,7 +1090,7 @@ function startPoll(){let el=0;
         st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';
         ra.classList.remove('hidden');vb.classList.remove('hidden');lgb.classList.add('hidden');
         vb.onclick=async()=>{const dr=await fetch('/api/jobs/'+jid+'/download');const dd=await dr.json();
-          window.open(dd.ply_url,'_blank')};
+          window.open(dd.glb_url||dd.ply_url,'_blank')};
         showNew()
       }else if(j.status==='error'){clearInterval(timer);
         addLog('');addLog('❌ ERROR: '+(j.error||'sin detalle'));
