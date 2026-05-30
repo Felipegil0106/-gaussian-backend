@@ -514,7 +514,11 @@ class Vast:
             "label": f"gaussian-{job_id[:8]}",
             "onstart": onstart,
             "env": {k: str(v) for k, v in env_vars.items()},
-            "runtype": "ssh",
+            # runtype "ssh args": "args" hace que Vast EJECUTE el onstart
+            # automáticamente al arrancar (sin esperar conexión manual);
+            # "ssh" deja acceso SSH disponible por si hay que depurar.
+            # Con solo "ssh" el worker no corría solo (se quedaba esperando).
+            "runtype": "ssh args",
         }
         print(f"[vast] alquilando instancia sobre oferta {offer_id}")
         data = await Vast._request("PUT", f"/asks/{offer_id}/", json_body=body)
