@@ -274,16 +274,21 @@ def build_bootstrap(wrap_bash_lc: bool = True) -> str:
         "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
         # FIX v3.11: instalamos EXPLÍCITAMENTE lo que simple_trainer.py importa.
         # FIX v3.13: nerfview importa matplotlib por dentro, y viser arrastra otras.
+        # FIX v3.14: simple_trainer.py también importa pycolmap (lee la salida de COLMAP).
         # Listamos toda la cadena de una vez para no ir cazando un import por corrida.
         "pip install -q imageio imageio-ffmpeg tensorboard tyro pyyaml "
-        "  nerfview viser splines tqdm matplotlib "
+        "  nerfview viser splines tqdm matplotlib pycolmap "
         "  scikit-learn opencv-python-headless plotly pillow; "
         "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-        # Verificamos importando nerfview (que es el que arrastra matplotlib) y gsplat;
-        # si la cadena entera funciona, el paso 6 ya no debería romper por imports.
-        "python3 -c \"import imageio, tyro, tensorboard, nerfview, matplotlib\" "
-        "  && echo \"[bootstrap] libs gsplat OK (incluye nerfview+matplotlib)\" "
-        "  || echo \"[bootstrap] WARN: falta alguna lib de gsplat\"; "
+        # FIX v3.14: en vez de adivinar imports uno por uno, intentamos IMPORTAR DE VERDAD
+        # las librerías que usa simple_trainer.py durante el bootstrap. Si falta CUALQUIERA,
+        # sale aquí (bootstrap ~5 min) y no después de 18 min de render.
+        # OJO: todo va en bash -lc '...', así que NO se pueden usar comillas simples aquí;
+        # solo comillas dobles escapadas (\").
+        "echo \"[bootstrap] probando imports de simple_trainer.py...\"; "
+        "cd /opt/gsplat-repo/examples && python3 -c \"import datasets.colmap, imageio, tyro, tensorboard, nerfview, matplotlib, pycolmap; print(\\\"[bootstrap] imports de gsplat OK (cadena completa)\\\")\" "
+        "  || echo \"[bootstrap] WARN: aun falta alguna lib para simple_trainer.py (mira arriba)\"; "
+        "cd /opt/gsplat-repo; "
         "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
         "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
         "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
