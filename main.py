@@ -87,6 +87,21 @@ BANNED_GPU_KEYWORDS = [
     "5090", "rtx pro", "b200", "b300", "h100", "h200",
 ]
 
+# ── VAST.AI (segunda fuente de GPU, solo para la RTX 4090 más barata) ──
+# Flujo de alquiler (lo que pediste):
+#   1) RunPod RTX 4090  → si no hay:
+#   2) Vast.ai RTX 4090 MÁS BARATA  → si no hay:
+#   3) RunPod segunda mejor opción (RTX 6000 Ada, L40S, ...)
+VAST_API_KEY = os.environ.get("VAST_API_KEY", "")
+VAST_API_URL = "https://console.vast.ai/api/v0"
+# En Vast usamos una imagen oficial de PyTorch+CUDA equivalente a la de RunPod,
+# para que el MISMO bootstrap funcione igual (gsplat 1.4.0 necesita CUDA 12.1 devel).
+VAST_IMAGE = "pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel"
+# Filtros para que Vast solo alquile máquinas SANAS y de verdad RTX 4090:
+VAST_MIN_DISK_GB    = 80      # disco mínimo en la máquina alquilada
+VAST_MIN_RELIABILITY = 0.95   # fiabilidad mínima del host (0-1); evita máquinas malas
+VAST_MIN_INET_DOWN  = 100.0   # Mbps mínimos de bajada (para descargar el ZIP rápido)
+
 # URL pública del worker.py en GitHub (lo que el pod baja al arrancar)
 WORKER_SCRIPT_URL   = os.environ.get(
     "WORKER_SCRIPT_URL",
@@ -209,6 +224,81 @@ def r2_upload_file(file_obj, key):
     get_r2().upload_fileobj(file_obj, R2_BUCKET, key)
 
 # ══════════════════════════════════════════════════════════════
+# BOOTSTRAP COMPARTIDO (lo corren igual RunPod y Vast.ai)
+# ══════════════════════════════════════════════════════════════
+
+def build_bootstrap(wrap_bash_lc: bool = True) -> str:
+    """Devuelve el comando de arranque que instala TODO y corre el worker.
+
+    Es EXACTAMENTE el mismo para RunPod y Vast — así un solo cambio aquí
+    arregla los dos sitios y nunca se desincronizan.
+
+    wrap_bash_lc=True  → envuelto en  bash -lc '...'  (RunPod 'dockerArgs').
+    wrap_bash_lc=False → cuerpo desnudo, sin comillas externas (Vast 'onstart',
+                         que ya se ejecuta dentro de bash).
+    """
+    # OJO: si wrap_bash_lc=True, todo va dentro de comillas SIMPLES, así que
+    # dentro NUNCA se pueden usar comillas simples (cerrarían el bloque).
+    body = (
+        "set -e; "
+        "echo \"[bootstrap] iniciando\"; "
+        "apt-get update -qq; "
+        "apt-get install -y -qq git wget ffmpeg colmap python3-pip "
+        "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb ninja-build; "
+        "echo \"[bootstrap] sistema OK (con xvfb + ninja)\"; "
+        "pip install -q --upgrade pip; "
+        "pip install -q boto3 plyfile opencv-python-headless requests tqdm pillow; "
+        # torch/torchvision (la imagen base los trae, pero por si acaso)
+        "python3 -c \"import torch\" 2>/dev/null || "
+        "  pip install -q torch==2.1.2 torchvision==0.16.2 "
+        "  --index-url https://download.pytorch.org/whl/cu121; "
+        "python3 -c \"import torchvision\" 2>/dev/null || "
+        "  pip install -q torchvision==0.16.2 "
+        "  --index-url https://download.pytorch.org/whl/cu121; "
+        # FIX v3.8: transformers 4.50+ DEJÓ de soportar torch 2.1 y se auto-desactiva
+        # ('Disabling PyTorch'), causando 'name torch is not defined' en Depth/Mask2Former.
+        "pip install -q \"transformers==4.44.2\" accelerate timm safetensors huggingface_hub scipy; "
+        # FIX CRÍTICO v3.7: transformers arrastra NumPy 2.x que ROMPE torch 2.1.
+        "pip install -q \"numpy<2\" --force-reinstall; "
+        "echo \"[bootstrap] python deps OK (numpy<2 forzado)\"; "
+        "python3 -c \"import numpy, torch, torchvision; print(f\\\"[bootstrap] numpy {numpy.__version__} torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
+        # FIX CRÍTICO v3.7: --recursive trae el submódulo glm (glm/glm.hpp que faltaba).
+        "if [ ! -d /opt/gsplat-repo/.git ]; then "
+        "  git clone --recursive --branch v1.4.0 --depth 1 "
+        "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
+        "else "
+        "  echo \"[bootstrap] gsplat-repo existe, actualizando submódulos\"; "
+        "  cd /opt/gsplat-repo && git submodule update --init --recursive; "
+        "fi; "
+        "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
+        "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
+        # FIX v3.11: instalamos EXPLÍCITAMENTE lo que simple_trainer.py importa.
+        # FIX v3.13: nerfview importa matplotlib por dentro, y viser arrastra otras.
+        # Listamos toda la cadena de una vez para no ir cazando un import por corrida.
+        "pip install -q imageio imageio-ffmpeg tensorboard tyro pyyaml "
+        "  nerfview viser splines tqdm matplotlib "
+        "  scikit-learn opencv-python-headless plotly pillow; "
+        "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
+        # Verificamos importando nerfview (que es el que arrastra matplotlib) y gsplat;
+        # si la cadena entera funciona, el paso 6 ya no debería romper por imports.
+        "python3 -c \"import imageio, tyro, tensorboard, nerfview, matplotlib\" "
+        "  && echo \"[bootstrap] libs gsplat OK (incluye nerfview+matplotlib)\" "
+        "  || echo \"[bootstrap] WARN: falta alguna lib de gsplat\"; "
+        "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
+        "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
+        "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
+        # En Vast el directorio de trabajo es /workspace igual que en RunPod
+        "mkdir -p /workspace; "
+        f"wget -q -O /workspace/worker.py \"{WORKER_SCRIPT_URL}\"; "
+        "echo \"[bootstrap] worker descargado, ejecutando\"; "
+        "cd /workspace && python3 -u worker.py"
+    )
+    if wrap_bash_lc:
+        return "bash -lc '" + body + "'"
+    return body
+
+
+# ══════════════════════════════════════════════════════════════
 # RUNPOD GRAPHQL (orquestación de Pod)
 # ══════════════════════════════════════════════════════════════
 
@@ -327,70 +417,8 @@ class RunPod:
         """Crea un Pod on-demand. Bootstrap descarga worker.py y lo ejecuta."""
         container_gb = container_gb or POD_CONTAINER_DISK_GB
         volume_gb = volume_gb or POD_VOLUME_DISK_GB
-        # Bootstrap: instala COLMAP, gsplat, deps, baja worker.py, lo corre
-        # Bootstrap del Pod: instala TODO y arranca el worker
-        # FIX v3.5:
-        #   - --no-build-isolation para que gsplat encuentre torch
-        #   - git clone idempotente (no falla si ya existe)
-        #   - verifica torch antes de compilar gsplat
-        bootstrap = (
-            "bash -lc 'set -e; "
-            "echo \"[bootstrap] iniciando\"; "
-            "apt-get update -qq; "
-            "apt-get install -y -qq git wget ffmpeg colmap python3-pip "
-            "  libgl1-mesa-glx libglib2.0-0 nodejs npm xvfb ninja-build; "
-            "echo \"[bootstrap] sistema OK (con xvfb + ninja)\"; "
-            "pip install -q --upgrade pip; "
-            "pip install -q boto3 plyfile opencv-python-headless requests tqdm pillow; "
-            # torch/torchvision (la imagen base los trae, pero por si acaso)
-            "python3 -c \"import torch\" 2>/dev/null || "
-            "  pip install -q torch==2.1.2 torchvision==0.16.2 "
-            "  --index-url https://download.pytorch.org/whl/cu121; "
-            "python3 -c \"import torchvision\" 2>/dev/null || "
-            "  pip install -q torchvision==0.16.2 "
-            "  --index-url https://download.pytorch.org/whl/cu121; "
-            # FIX v3.8: transformers 4.50+ DEJÓ de soportar torch 2.1 y se auto-desactiva
-            # ('Disabling PyTorch'), causando 'name torch is not defined' en Depth/Mask2Former.
-            # 4.44.2 es la última serie que soporta torch 2.1 con Depth-Anything-V2 y Mask2Former.
-            "pip install -q \"transformers==4.44.2\" accelerate timm safetensors huggingface_hub scipy; "
-            # FIX CRÍTICO v3.7: transformers arrastra NumPy 2.x que ROMPE torch 2.1.
-            # Forzamos numpy<2 al FINAL para mantener compatibilidad con torch precompilado.
-            "pip install -q \"numpy<2\" --force-reinstall; "
-            "echo \"[bootstrap] python deps OK (numpy<2 forzado)\"; "
-            "python3 -c \"import numpy, torch, torchvision; print(f\\\"[bootstrap] numpy {numpy.__version__} torch {torch.__version__} tv {torchvision.__version__} CUDA={torch.cuda.is_available()}\\\")\"; "
-            # FIX CRÍTICO v3.7: --recursive trae el submódulo glm (glm/glm.hpp que faltaba).
-            # Sin --recursive, gsplat NO compila.
-            "if [ ! -d /opt/gsplat-repo/.git ]; then "
-            "  git clone --recursive --branch v1.4.0 --depth 1 "
-            "    https://github.com/nerfstudio-project/gsplat.git /opt/gsplat-repo; "
-            "else "
-            "  echo \"[bootstrap] gsplat-repo existe, actualizando submódulos\"; "
-            "  cd /opt/gsplat-repo && git submodule update --init --recursive; "
-            "fi; "
-            "cd /opt/gsplat-repo && pip install -q --no-build-isolation . && "
-            "  pip install -q -r examples/requirements.txt 2>/dev/null || true; "
-            # FIX v3.11: examples/requirements.txt se instala con '|| true', así que si
-            # FALLA se ignora en silencio y faltan librerías (paso 6 reventaba con
-            # 'No module named imageio'). Instalamos EXPLÍCITAMENTE lo que simple_trainer.py
-            # importa, SIN '|| true', para que un fallo real se vea en el log.
-            "pip install -q imageio imageio-ffmpeg tensorboard tyro pyyaml "
-            "  nerfview viser splines tqdm; "
-            # Reforzar numpy<2 otra vez (examples/requirements puede re-instalar numpy 2)
-            "pip install -q \"numpy<2\" --force-reinstall 2>/dev/null || true; "
-            # Verificar que imageio quedó importable ANTES de llegar al paso 6.
-            # OJO: todo el bootstrap va en bash -lc '...', así que aquí NO se pueden
-            # usar comillas simples (cerrarían el bloque). Solo comillas dobles escapadas.
-            "python3 -c \"import imageio, tyro, tensorboard\" "
-            "  && echo \"[bootstrap] libs gsplat OK\" "
-            "  || echo \"[bootstrap] WARN: falta alguna lib de gsplat\"; "
-            # Verificar que gsplat compiló de verdad (no solo que el comando terminó)
-            "python3 -c \"import gsplat; print(f\\\"[bootstrap] gsplat {gsplat.__version__} OK\\\")\" "
-            "  || echo \"[bootstrap] WARN gsplat no importa, el worker lo reintentará\"; "
-            "npm install -g @playcanvas/splat-transform 2>/dev/null || true; "
-            f"wget -q -O /workspace/worker.py \"{WORKER_SCRIPT_URL}\"; "
-            "echo \"[bootstrap] worker descargado, ejecutando\"; "
-            "cd /workspace && python3 -u worker.py'"
-        )
+        # El bootstrap es COMPARTIDO con Vast.ai (misma instalación, mismo worker).
+        bootstrap = build_bootstrap()
         env_list = [{"key":k, "value":str(v)} for k, v in env_vars.items()]
         mutation = """
         mutation deploy($input: PodFindAndDeployOnDemandInput!) {
@@ -445,6 +473,259 @@ class RunPod:
             return []
 
 # ══════════════════════════════════════════════════════════════
+# VAST.AI (API REST) — solo para la RTX 4090 MÁS BARATA
+# ══════════════════════════════════════════════════════════════
+
+class Vast:
+    """Cliente mínimo de Vast.ai. Misma idea que RunPod pero API REST.
+
+    En Vast el flujo es:
+      1) GET  /bundles   → lista ofertas (máquinas disponibles) con su precio
+      2) ordenamos por precio total $/hora y elegimos la más barata
+      3) PUT  /asks/{id}/ → crea la instancia con nuestra imagen + onstart
+    El onstart corre el MISMO bootstrap que RunPod.
+    """
+
+    @staticmethod
+    async def _request(method, path, json_body=None, params=None):
+        headers = {"Authorization": f"Bearer {VAST_API_KEY}",
+                   "Content-Type": "application/json"}
+        url = f"{VAST_API_URL}{path}"
+        async with httpx.AsyncClient(timeout=40) as c:
+            r = await c.request(method, url, headers=headers,
+                                json=json_body, params=params)
+            r.raise_for_status()
+            if r.text.strip():
+                return r.json()
+            return {}
+
+    @staticmethod
+    async def find_cheapest_4090():
+        """Busca la RTX 4090 más barata, sana y disponible. Devuelve la oferta o None."""
+        # Filtro que entiende Vast: GPU rentable, nombre 4090, 1 sola GPU,
+        # disco/fiabilidad/red mínimos. El resto lo ordenamos nosotros por precio.
+        query = {
+            "verified": {"eq": True},
+            "rentable": {"eq": True},
+            "num_gpus": {"eq": 1},
+            "gpu_name": {"eq": "RTX 4090"},
+            "disk_space": {"gte": VAST_MIN_DISK_GB},
+            "reliability2": {"gte": VAST_MIN_RELIABILITY},
+            "inet_down": {"gte": VAST_MIN_INET_DOWN},
+            "rented": {"eq": False},
+            "order": [["dph_total", "asc"]],   # dph_total = dólares por hora, ascendente
+            "type": "on-demand",
+        }
+        try:
+            data = await Vast._request("GET", "/bundles",
+                                       params={"q": json.dumps(query)})
+        except Exception as e:
+            print(f"[vast] búsqueda falló: {e}")
+            return None
+        offers = data.get("offers", []) or []
+        if not offers:
+            print("[vast] no hay RTX 4090 disponibles ahora")
+            return None
+        # Ya viene ordenado por precio, pero re-ordenamos por seguridad
+        offers.sort(key=lambda o: o.get("dph_total", 9e9))
+        best = offers[0]
+        print(f"[vast] 4090 más barata: id={best.get('id')} "
+              f"${best.get('dph_total'):.3f}/h  host_rel={best.get('reliability2')}")
+        return best
+
+    @staticmethod
+    async def create_instance(job_id, offer_id, env_vars):
+        """Crea (alquila) la instancia Vast con el bootstrap compartido."""
+        # Vast inyecta variables con -e en el docker; las pasamos en 'env'.
+        # El onstart corre en bash, así que NO usamos el wrapper bash -lc.
+        onstart = build_bootstrap(wrap_bash_lc=False)
+        body = {
+            "client_id": "me",
+            "image": VAST_IMAGE,
+            "disk": float(max(VAST_MIN_DISK_GB, POD_CONTAINER_DISK_GB)),
+            "label": f"gaussian-{job_id[:8]}",
+            "onstart": onstart,
+            "env": {k: str(v) for k, v in env_vars.items()},
+            "runtype": "ssh",
+        }
+        print(f"[vast] alquilando instancia sobre oferta {offer_id}")
+        data = await Vast._request("PUT", f"/asks/{offer_id}/", json_body=body)
+        # Vast devuelve {'success': True, 'new_contract': <instance_id>}
+        if not data.get("success"):
+            raise RuntimeError(f"Vast rechazó la creación: {data}")
+        instance_id = data.get("new_contract")
+        print(f"[vast] ✓ instancia creada: {instance_id}")
+        return {"id": str(instance_id)}
+
+    @staticmethod
+    async def terminate_instance(instance_id):
+        """Destruye la instancia Vast (deja de cobrar)."""
+        if not instance_id:
+            return False
+        try:
+            await Vast._request("DELETE", f"/instances/{instance_id}/")
+            print(f"[vast] instancia {instance_id} terminada")
+            return True
+        except Exception as e:
+            print(f"[vast] terminate falló: {e}")
+            return False
+
+    @staticmethod
+    async def list_my_instances():
+        try:
+            data = await Vast._request("GET", "/instances/")
+            return data.get("instances", []) or []
+        except Exception:
+            return []
+
+
+# ══════════════════════════════════════════════════════════════
+# PROVISIÓN DE GPU — la cascada que pediste
+#   1) RunPod RTX 4090
+#   2) Vast.ai RTX 4090 más barata
+#   3) RunPod segunda mejor opción (resto del ranking)
+# ══════════════════════════════════════════════════════════════
+
+# Guardamos el pod_id con prefijo para saber a quién terminar después:
+#   "runpod:<id>"  o  "vast:<id>"
+def _tag_pod(provider, pid):
+    return f"{provider}:{pid}"
+
+def _split_pod_tag(tagged):
+    """Devuelve (provider, id). Si no tiene prefijo, asume runpod (compatibilidad)."""
+    if not tagged:
+        return ("runpod", "")
+    if ":" in tagged:
+        prov, _, pid = tagged.partition(":")
+        if prov in ("runpod", "vast"):
+            return (prov, pid)
+    return ("runpod", tagged)
+
+
+async def _runpod_create_specific_4090(job_id, env_vars):
+    """Intenta SOLO la RTX 4090 en RunPod (paso 1 de la cascada)."""
+    all_gpus = await RunPod.list_all_gpus()
+    if not all_gpus:
+        raise RuntimeError("RunPod no devolvió GPUs. ¿API key correcta?")
+    req, forb = ["4090"], ["pro", "ti", "mobile"]
+    for g in all_gpus:
+        if RunPod._matches(g.get("displayName", ""), req, forb):
+            gid = g.get("id")
+            disk = RunPod.disk_config_for("RTX 4090")
+            pod = await RunPod.create_pod(
+                job_id, gid, env_vars,
+                container_gb=disk["container"], volume_gb=disk["volume"])
+            return pod, "RTX 4090", g.get("displayName", "RTX 4090"), disk
+    raise RuntimeError("SUPPLY_CONSTRAINT: RunPod no tiene RTX 4090 ahora")
+
+
+async def _runpod_create_second_best(job_id, env_vars):
+    """Recorre el ranking de RunPod SALTÁNDOSE la 4090 (paso 3 de la cascada)."""
+    all_gpus = await RunPod.list_all_gpus()
+    if not all_gpus:
+        raise RuntimeError("RunPod no devolvió GPUs")
+
+    candidates = []
+    seen_ids = set()
+    for label, req, forb in GPU_PREFERENCES:
+        if label == "RTX 4090":
+            continue  # ya se intentó en el paso 1
+        for g in all_gpus:
+            gid = g.get("id")
+            if gid in seen_ids:
+                continue
+            if RunPod._matches(g.get("displayName", ""), req, forb):
+                candidates.append((label, g.get("displayName", ""), gid))
+                seen_ids.add(gid)
+                break
+
+    # Fallback de emergencia: cualquier GPU ≥20GB no Blackwell
+    for g in all_gpus:
+        gid = g.get("id"); name = g.get("displayName", ""); vram = g.get("memoryInGb", 0)
+        if gid in seen_ids or vram < 20:
+            continue
+        if any(b in name.lower() for b in BANNED_GPU_KEYWORDS):
+            continue
+        candidates.append((f"FALLBACK ({name})", name, gid))
+        seen_ids.add(gid)
+
+    errors = []
+    for label, display_name, gid in candidates:
+        disk = RunPod.disk_config_for(label)
+        print(f"[cascada-3] Intentando {label} en RunPod")
+        try:
+            pod = await RunPod.create_pod(
+                job_id, gid, env_vars,
+                container_gb=disk["container"], volume_gb=disk["volume"])
+            return pod, label, display_name, disk
+        except Exception as e:
+            if "SUPPLY_CONSTRAINT" in str(e) or "no longer any instances" in str(e).lower():
+                errors.append(label)
+                continue
+            raise
+    raise RuntimeError(f"RunPod sin stock en 2ª opción. Probadas: {', '.join(errors[:8])}")
+
+
+async def provision_gpu(job_id, env_vars):
+    """Cascada de alquiler. Devuelve (pod_tagged_id, provider, gpu_label, gpu_display, disk).
+
+    pod_tagged_id ya viene con prefijo 'runpod:' o 'vast:' para el watchdog.
+    """
+    steps_failed = []
+
+    # ── PASO 1: RunPod RTX 4090 ──
+    if RUNPOD_API_KEY:
+        try:
+            pod, label, disp, disk = await _runpod_create_specific_4090(job_id, env_vars)
+            return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
+        except Exception as e:
+            print(f"[cascada-1] RunPod 4090 no disponible: {e}")
+            steps_failed.append("RunPod 4090")
+    else:
+        print("[cascada-1] RUNPOD_API_KEY no configurada, salto paso 1")
+
+    # ── PASO 2: Vast.ai RTX 4090 más barata ──
+    if VAST_API_KEY:
+        try:
+            offer = await Vast.find_cheapest_4090()
+            if offer:
+                inst = await Vast.create_instance(job_id, offer.get("id"), env_vars)
+                disk = {"container": int(max(VAST_MIN_DISK_GB, POD_CONTAINER_DISK_GB)),
+                        "volume": 0}
+                price = offer.get("dph_total", 0)
+                disp = f"RTX 4090 (Vast ${price:.3f}/h)"
+                return _tag_pod("vast", inst.get("id", "")), "vast", "RTX 4090 (Vast)", disp, disk
+            else:
+                steps_failed.append("Vast 4090 (sin stock)")
+        except Exception as e:
+            print(f"[cascada-2] Vast falló: {e}")
+            steps_failed.append("Vast 4090 (error)")
+    else:
+        print("[cascada-2] VAST_API_KEY no configurada, salto paso 2")
+
+    # ── PASO 3: RunPod segunda mejor opción ──
+    if RUNPOD_API_KEY:
+        try:
+            pod, label, disp, disk = await _runpod_create_second_best(job_id, env_vars)
+            return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
+        except Exception as e:
+            print(f"[cascada-3] RunPod 2ª opción falló: {e}")
+            steps_failed.append("RunPod 2ª opción")
+
+    raise RuntimeError(
+        "No se pudo alquilar GPU en ninguna fuente. "
+        f"Intentado: {', '.join(steps_failed)}. Reintenta en 5-10 min."
+    )
+
+
+async def terminate_any(pod_tagged_id):
+    """Termina un pod/instancia sin importar la fuente (lee el prefijo)."""
+    provider, pid = _split_pod_tag(pod_tagged_id)
+    if provider == "vast":
+        return await Vast.terminate_instance(pid)
+    return await RunPod.terminate_pod(pid)
+
+# ══════════════════════════════════════════════════════════════
 # HMAC
 # ══════════════════════════════════════════════════════════════
 
@@ -465,6 +746,7 @@ def index():
 def health():
     return {"status":"ok", "time":datetime.now(timezone.utc).isoformat(),
             "runpod_configured": bool(RUNPOD_API_KEY),
+            "vast_configured": bool(VAST_API_KEY),
             "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY)}
 
 @app.get("/api/debug/gpus")
@@ -520,20 +802,20 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
         "QUALITY": quality,
     }
     try:
-        pod, gpu_label, gpu_displayname, disk = \
-            await RunPod.try_create_pod_with_fallbacks(job_id, env)
+        pod_tagged, provider, gpu_label, gpu_displayname, disk = \
+            await provision_gpu(job_id, env)
     except Exception as e:
         job_update(job_id, status="error", error=f"Sin GPU: {e}")
         raise HTTPException(503, f"Sin GPU disponible: {e}")
 
     job_update(job_id, status="processing",
-               pod_id=pod.get("id",""),
+               pod_id=pod_tagged,
                gpu_type=gpu_displayname,
-               message=f"Pod {gpu_label} arrancando (~5 min bootstrap)")
+               message=f"GPU {gpu_label} ({provider}) arrancando (~5 min bootstrap)")
 
     return {"job_id":job_id, "status":"processing", "quality":quality,
-            "pod_id":pod.get("id"), "gpu_type":gpu_displayname,
-            "gpu_label":gpu_label,
+            "pod_id":pod_tagged, "provider":provider,
+            "gpu_type":gpu_displayname, "gpu_label":gpu_label,
             "container_gb":disk["container"], "volume_gb":disk["volume"]}
 
 @app.get("/api/jobs/{job_id}")
@@ -620,9 +902,9 @@ async def worker_callback(job_id: str, request: Request,
                    has_collision=1 if payload.get("has_collision") else 0,
                    seconds=payload.get("seconds", 0),
                    last_heartbeat=now)
-        # TERMINAR EL POD (clave: no dejar GPU cobrando)
+        # TERMINAR EL POD (clave: no dejar GPU cobrando) — RunPod o Vast
         if j.get("pod_id"):
-            await RunPod.terminate_pod(j["pod_id"])
+            await terminate_any(j["pod_id"])
         return {"ok":True}
 
     elif cb_type == "error":
@@ -633,7 +915,7 @@ async def worker_callback(job_id: str, request: Request,
                    worker_log=log_text,
                    last_heartbeat=now)
         if j.get("pod_id"):
-            await RunPod.terminate_pod(j["pod_id"])
+            await terminate_any(j["pod_id"])
         return {"ok":True}
 
     return {"ok":False, "reason":"tipo callback desconocido"}
@@ -668,28 +950,45 @@ async def _watchdog_pass():
             continue
         if age_min > POD_HEARTBEAT_TIMEOUT_MIN:
             print(f"[watchdog] Job {r['id']} sin HB hace {age_min:.0f} min — matando pod")
-            await RunPod.terminate_pod(r["pod_id"])
+            await terminate_any(r["pod_id"])
             job_update(r["id"], status="error",
                        error=f"Sin heartbeat hace {age_min:.0f} min (timeout)")
 
-    # 2) Pods de RunPod que NO están en nuestra DB → huérfanos, matar
+    # 2) Pods/instancias que NO están en nuestra DB → huérfanos, matar
+    known_runpod, known_vast = set(), set()
+    with get_db() as db:
+        for r in db.execute("SELECT pod_id FROM jobs WHERE pod_id IS NOT NULL").fetchall():
+            prov, pid = _split_pod_tag(r["pod_id"])
+            if not pid:
+                continue
+            (known_vast if prov == "vast" else known_runpod).add(pid)
+
+    # 2a) Huérfanos en RunPod
     try:
         pods = await RunPod.list_my_pods()
     except Exception:
         pods = []
-    known_pods = set()
-    with get_db() as db:
-        for r in db.execute("SELECT pod_id FROM jobs WHERE pod_id IS NOT NULL").fetchall():
-            if r["pod_id"]:
-                known_pods.add(r["pod_id"])
-
     for p in pods:
         pid = p.get("id")
-        if pid and pid not in known_pods:
+        if pid and pid not in known_runpod:
             uptime = (p.get("runtime") or {}).get("uptimeInSeconds", 0)
             if uptime and uptime > POD_MAX_LIFETIME_MIN * 60:
-                print(f"[watchdog] Pod huérfano {pid} con {uptime}s — terminando")
+                print(f"[watchdog] Pod RunPod huérfano {pid} con {uptime}s — terminando")
                 await RunPod.terminate_pod(pid)
+
+    # 2b) Huérfanos en Vast
+    if VAST_API_KEY:
+        try:
+            insts = await Vast.list_my_instances()
+        except Exception:
+            insts = []
+        for ins in insts:
+            iid = str(ins.get("id", ""))
+            if iid and iid not in known_vast:
+                uptime = ins.get("duration", 0) or 0  # segundos corriendo
+                if uptime and uptime > POD_MAX_LIFETIME_MIN * 60:
+                    print(f"[watchdog] Instancia Vast huérfana {iid} con {uptime}s — terminando")
+                    await Vast.terminate_instance(iid)
 
 # ══════════════════════════════════════════════════════════════
 # STARTUP
@@ -700,6 +999,7 @@ async def startup():
     init_db()
     asyncio.create_task(watchdog_loop())
     print(f"Backend v3 iniciado. RunPod={'OK' if RUNPOD_API_KEY else 'NO'}, "
+          f"Vast={'OK' if VAST_API_KEY else 'NO'}, "
           f"R2={'OK' if R2_ACCOUNT_ID else 'NO'}, BACKEND_URL={BACKEND_URL}")
 
 # ══════════════════════════════════════════════════════════════
