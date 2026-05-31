@@ -38,8 +38,33 @@ import uvicorn
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 
+# ── RunPod: soporte para DOS cuentas ──
+# Cada cuenta tiene su propia API key. La página deja elegir cuál usar.
+# RUNPOD_API_KEY  = cuenta 1 (la de siempre)
+# RUNPOD_API_KEY_2 = cuenta 2 (la nueva). Si no se configura, solo habrá cuenta 1.
 RUNPOD_API_KEY      = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_API_KEY_2    = os.environ.get("RUNPOD_API_KEY_2", "")
 RUNPOD_API_URL      = "https://api.runpod.io/graphql"
+
+# Nombres visibles de las cuentas (para mostrarlos en la página)
+RUNPOD_CUENTA_1_NOMBRE = os.environ.get("RUNPOD_CUENTA_1_NOMBRE", "Cuenta 1")
+RUNPOD_CUENTA_2_NOMBRE = os.environ.get("RUNPOD_CUENTA_2_NOMBRE", "Cuenta 2")
+
+def _runpod_cuentas_disponibles():
+    """Devuelve la lista de cuentas RunPod configuradas (con key)."""
+    cuentas = []
+    if RUNPOD_API_KEY:
+        cuentas.append({"id": "1", "nombre": RUNPOD_CUENTA_1_NOMBRE})
+    if RUNPOD_API_KEY_2:
+        cuentas.append({"id": "2", "nombre": RUNPOD_CUENTA_2_NOMBRE})
+    return cuentas
+
+def _runpod_key_de_cuenta(cuenta_id):
+    """Devuelve la API key de la cuenta elegida ('1' o '2').
+    Si la cuenta pedida no tiene key, cae a la cuenta 1 (compatibilidad)."""
+    if str(cuenta_id) == "2" and RUNPOD_API_KEY_2:
+        return RUNPOD_API_KEY_2
+    return RUNPOD_API_KEY
 
 # Imagen PROPIA con COLMAP + OpenMVS precompilados (para generar malla).
 # Construida con GitHub Actions y subida a Docker Hub.
@@ -164,7 +189,7 @@ def init_db():
         for col, typ in [("pod_id","TEXT"),("gpu_type","TEXT"),
                          ("last_heartbeat","TEXT"),("progress","REAL"),
                          ("message","TEXT"),("worker_log","TEXT"),
-                         ("glb_mb","REAL")]:
+                         ("glb_mb","REAL"),("runpod_cuenta","TEXT")]:
             try: db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError: pass
 
@@ -261,10 +286,20 @@ def build_bootstrap(wrap_bash_lc: bool = True) -> str:
 
 class RunPod:
 
+    # API key de la cuenta ACTIVA para el job en curso. provision_gpu la setea
+    # según la cuenta que el usuario eligió en la página. Por defecto, cuenta 1.
+    _api_key_activa = RUNPOD_API_KEY
+
+    @staticmethod
+    def set_cuenta(cuenta_id):
+        """Fija la cuenta RunPod a usar (su API key) para las siguientes llamadas."""
+        RunPod._api_key_activa = _runpod_key_de_cuenta(cuenta_id)
+
     @staticmethod
     async def _query(query, variables=None):
+        key = RunPod._api_key_activa or RUNPOD_API_KEY
         headers = {"Content-Type":"application/json",
-                   "Authorization":f"Bearer {RUNPOD_API_KEY}"}
+                   "Authorization":f"Bearer {key}"}
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post(RUNPOD_API_URL, headers=headers,
                             json={"query":query, "variables":variables or {}})
@@ -525,16 +560,24 @@ async def _runpod_create_second_best(job_id, env_vars):
     raise RuntimeError(f"RunPod sin stock en 2ª opción. Probadas: {', '.join(errors[:8])}")
 
 
-async def provision_gpu(job_id, env_vars):
+async def provision_gpu(job_id, env_vars, cuenta_id="1"):
     """Cascada de alquiler. Devuelve (pod_tagged_id, provider, gpu_label, gpu_display, disk).
 
     pod_tagged_id ya viene con prefijo 'runpod:' para el watchdog.
     Solo usa RunPod (Vast fue retirado).
+
+    cuenta_id: '1' o '2' → elige cuál cuenta de RunPod usar. La MISMA jerarquía
+    de GPUs (RTX 4090 → segunda mejor) se aplica a la cuenta elegida.
     """
+    # Fijar la cuenta RunPod elegida ANTES de la cascada (misma jerarquía).
+    RunPod.set_cuenta(cuenta_id)
+    key_activa = _runpod_key_de_cuenta(cuenta_id)
+    print(f"[provision] usando RunPod cuenta {cuenta_id}")
+
     steps_failed = []
 
     # ── PASO 1: RunPod RTX 4090 ──
-    if RUNPOD_API_KEY:
+    if key_activa:
         try:
             pod, label, disp, disk = await _runpod_create_specific_4090(job_id, env_vars)
             return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
@@ -542,10 +585,10 @@ async def provision_gpu(job_id, env_vars):
             print(f"[cascada-1] RunPod 4090 no disponible: {e}")
             steps_failed.append("RunPod 4090")
     else:
-        print("[cascada-1] RUNPOD_API_KEY no configurada, salto paso 1")
+        print("[cascada-1] cuenta sin API key, salto paso 1")
 
-    # ── PASO 2: RunPod segunda mejor opción ──
-    if RUNPOD_API_KEY:
+    # ── PASO 2: RunPod segunda mejor opción (misma cuenta elegida) ──
+    if key_activa:
         try:
             pod, label, disp, disk = await _runpod_create_second_best(job_id, env_vars)
             return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
@@ -559,9 +602,12 @@ async def provision_gpu(job_id, env_vars):
     )
 
 
-async def terminate_any(pod_tagged_id):
-    """Termina un pod de RunPod (lee el prefijo)."""
+async def terminate_any(pod_tagged_id, cuenta_id="1"):
+    """Termina un pod de RunPod (lee el prefijo).
+    cuenta_id: la cuenta RunPod donde se creó el pod (un pod de la cuenta 2 solo
+    se apaga con la key de la cuenta 2)."""
     provider, pid = _split_pod_tag(pod_tagged_id)
+    RunPod.set_cuenta(cuenta_id)
     return await RunPod.terminate_pod(pid)
 
 # ══════════════════════════════════════════════════════════════
@@ -585,7 +631,13 @@ def index():
 def health():
     return {"status":"ok", "time":datetime.now(timezone.utc).isoformat(),
             "runpod_configured": bool(RUNPOD_API_KEY),
+            "runpod_cuenta2_configured": bool(RUNPOD_API_KEY_2),
             "r2_configured": bool(R2_ACCOUNT_ID and R2_ACCESS_KEY)}
+
+@app.get("/api/runpod/cuentas")
+def runpod_cuentas():
+    """Lista las cuentas de RunPod configuradas (para el selector de la página)."""
+    return {"cuentas": _runpod_cuentas_disponibles()}
 
 @app.get("/api/debug/gpus")
 async def debug_gpus():
@@ -606,9 +658,12 @@ async def debug_gpus():
     }
 
 @app.post("/api/jobs")
-async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
+async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
+                     cuenta_runpod: str = Form("1")):
     if quality not in ("fast","balanced","quality"):
         raise HTTPException(400, "quality debe ser: fast, balanced, quality")
+    if cuenta_runpod not in ("1", "2"):
+        cuenta_runpod = "1"
 
     job_id = str(uuid.uuid4())[:12]
     now = datetime.now(timezone.utc).isoformat()
@@ -622,6 +677,9 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
                               last_heartbeat,progress,message)
             VALUES (?,?,?,?,?,?,?,?,?,?)
         """, (job_id,"uploading",quality,now,now,ply_key,glb_key,now,0.0,"Subiendo a R2"))
+
+    # Guardar la cuenta RunPod elegida (para terminar el pod en esa misma cuenta)
+    job_update(job_id, runpod_cuenta=cuenta_runpod)
 
     # Subir ZIP a R2
     try:
@@ -641,7 +699,7 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
     }
     try:
         pod_tagged, provider, gpu_label, gpu_displayname, disk = \
-            await provision_gpu(job_id, env)
+            await provision_gpu(job_id, env, cuenta_id=cuenta_runpod)
     except Exception as e:
         job_update(job_id, status="error", error=f"Sin GPU: {e}")
         raise HTTPException(503, f"Sin GPU disponible: {e}")
@@ -652,7 +710,7 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast")):
                message=f"GPU {gpu_label} ({provider}) arrancando (~5 min bootstrap)")
 
     return {"job_id":job_id, "status":"processing", "quality":quality,
-            "pod_id":pod_tagged, "provider":provider,
+            "pod_id":pod_tagged, "provider":provider, "cuenta_runpod":cuenta_runpod,
             "gpu_type":gpu_displayname, "gpu_label":gpu_label,
             "container_gb":disk["container"], "volume_gb":disk["volume"]}
 
@@ -756,7 +814,7 @@ async def worker_callback(job_id: str, request: Request,
                    last_heartbeat=now)
         # TERMINAR EL POD (clave: no dejar GPU cobrando)
         if j.get("pod_id"):
-            await terminate_any(j["pod_id"])
+            await terminate_any(j["pod_id"], j.get("runpod_cuenta") or "1")
         return {"ok":True}
 
     elif cb_type == "error":
@@ -767,7 +825,7 @@ async def worker_callback(job_id: str, request: Request,
                    worker_log=log_text,
                    last_heartbeat=now)
         if j.get("pod_id"):
-            await terminate_any(j["pod_id"])
+            await terminate_any(j["pod_id"], j.get("runpod_cuenta") or "1")
         return {"ok":True}
 
     return {"ok":False, "reason":"tipo callback desconocido"}
@@ -789,7 +847,7 @@ async def _watchdog_pass():
     # 1) Jobs procesando con heartbeat viejo → matar pod
     with get_db() as db:
         rows = db.execute("""
-            SELECT id, pod_id, last_heartbeat FROM jobs
+            SELECT id, pod_id, last_heartbeat, runpod_cuenta FROM jobs
             WHERE status='processing' AND pod_id IS NOT NULL AND pod_id != ''
         """).fetchall()
     for r in rows:
@@ -802,7 +860,7 @@ async def _watchdog_pass():
             continue
         if age_min > POD_HEARTBEAT_TIMEOUT_MIN:
             print(f"[watchdog] Job {r['id']} sin HB hace {age_min:.0f} min — matando pod")
-            await terminate_any(r["pod_id"])
+            await terminate_any(r["pod_id"], r["runpod_cuenta"] if "runpod_cuenta" in r.keys() else "1")
             job_update(r["id"], status="error",
                        error=f"Sin heartbeat hace {age_min:.0f} min (timeout)")
 
@@ -893,6 +951,8 @@ select{background:#2a2a2a;color:#eee}
     </div>
     <input type="file" id="fileInput" accept=".zip" style="display:none">
     <div class="file-info" id="fileInfo"></div>
+    <label style="display:block;margin-top:12px;font-size:13px;color:#aaa">Cuenta de RunPod</label>
+    <select id="cuenta"></select>
     <select id="quality">
       <option value="fast">Rápido (7K iter, ~10 min training)</option>
       <option value="balanced">Balanceado (30K iter, ~25 min)</option>
@@ -915,11 +975,21 @@ select{background:#2a2a2a;color:#eee}
 const dz=document.getElementById('dropzone'),fi=document.getElementById('fileInput');
 const info=document.getElementById('fileInfo'),btn=document.getElementById('renderBtn');
 const qsel=document.getElementById('quality'),up=document.getElementById('upload-card');
+const csel=document.getElementById('cuenta');
 const pr=document.getElementById('progress'),st=document.getElementById('statusText');
 const lb=document.getElementById('logBox'),ra=document.getElementById('resultActions');
 const vb=document.getElementById('viewBtn'),lgb=document.getElementById('logBtn');
 const nb=document.getElementById('newBtn'),bf=document.getElementById('barFill');
 let sel=null,jid=null,timer=null;
+// Cargar las cuentas de RunPod disponibles en el selector
+(async()=>{try{const r=await fetch('/api/runpod/cuentas');const d=await r.json();
+  csel.innerHTML='';
+  (d.cuentas||[]).forEach(c=>{const o=document.createElement('option');
+    o.value=c.id;o.textContent='RunPod: '+c.nombre;csel.appendChild(o)});
+  if(!csel.options.length){const o=document.createElement('option');
+    o.value='1';o.textContent='RunPod: Cuenta 1';csel.appendChild(o)}
+}catch(e){const o=document.createElement('option');
+  o.value='1';o.textContent='RunPod: Cuenta 1';csel.appendChild(o)}})();
 dz.onclick=()=>fi.click();
 dz.ondragover=e=>{e.preventDefault();dz.classList.add('drag')};
 dz.ondragleave=()=>dz.classList.remove('drag');
@@ -931,6 +1001,7 @@ function addLog(m){lb.textContent+='\\n'+m;lb.scrollTop=lb.scrollHeight}
 btn.onclick=async()=>{if(!sel)return;up.classList.add('hidden');pr.style.display='block';
   ra.classList.add('hidden');lb.textContent='Subiendo ZIP a R2...';st.innerHTML='<span class="spinner"></span>Subiendo...';
   const fd=new FormData();fd.append('file',sel);fd.append('quality',qsel.value);
+  fd.append('cuenta_runpod',csel.value||'1');
   try{const r=await fetch('/api/jobs',{method:'POST',body:fd});
     if(!r.ok){throw new Error('HTTP '+r.status+': '+await r.text())}
     const d=await r.json();jid=d.job_id;
@@ -947,16 +1018,22 @@ function startPoll(){let el=0;
         addLog('');addLog('✅ RENDER COMPLETADO');
         addLog('Frames: '+(j.frames_used||'?')+' · '+(j.ply_mb||'?')+' MB · '+(j.seconds||'?')+'s');
         st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';
-        ra.classList.remove('hidden');vb.classList.remove('hidden');lgb.classList.add('hidden');
+        ra.classList.remove('hidden');vb.classList.remove('hidden');
         vb.onclick=async()=>{const dr=await fetch('/api/jobs/'+jid+'/download');const dd=await dr.json();
           window.open(dd.glb_url||dd.ply_url,'_blank')};
+        // Mostrar SIEMPRE el botón de log (también en éxito), para revisar la IA
+        lgb.textContent='📄 Ver / descargar log';
+        lgb.classList.remove('hidden');
+        lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');
         showNew()
       }else if(j.status==='error'){clearInterval(timer);
         addLog('');addLog('❌ ERROR: '+(j.error||'sin detalle'));
         st.className='status error';st.textContent='❌ Falló';
         ra.classList.remove('hidden');vb.classList.add('hidden');
-        if(j.has_log){lgb.classList.remove('hidden');
-          lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank')}
+        // Mostrar el botón de log en error (aunque has_log no venga)
+        lgb.textContent='📄 Descargar log del error';
+        lgb.classList.remove('hidden');
+        lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');
         showNew()
       }
     }catch(e){addLog('⚠ '+e.message)}
