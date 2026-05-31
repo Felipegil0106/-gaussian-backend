@@ -81,7 +81,7 @@ POD_MIN_MEMORY_GB     = 32
 # Ranking por rendimiento puro. Matching FLEXIBLE por keywords.
 GPU_PREFERENCES = [
     ("RTX 4090",        ["4090"],                ["pro", "ti", "mobile"]),
-    ("RTX 6000",        ["6000"],                ["ada", "a6000", "pro"]),
+    ("RTX A6000",       ["a6000"],               ["ada"]),
     ("RTX 6000 Ada",    ["6000", "ada"],         ["pro"]),
     ("L40S",            ["l40s"],                []),
     ("L40",             ["l40"],                 ["l40s"]),
@@ -90,7 +90,6 @@ GPU_PREFERENCES = [
     ("A100 80GB",       ["a100", "80"],          ["sxm", "pcie"]),
     ("A100 PCIe 40GB",  ["a100", "pcie", "40"],  ["80", "sxm"]),
     ("A100 40GB",       ["a100", "40"],          ["80", "sxm", "pcie"]),
-    ("RTX A6000",       ["a6000"],               ["ada"]),
     ("A40",             ["a40"],                 ["rtx", "ada"]),
     ("RTX 3090 Ti",     ["3090", "ti"],          []),
     ("RTX 3090",        ["3090"],                ["ti"]),
