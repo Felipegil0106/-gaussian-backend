@@ -68,7 +68,7 @@ def _runpod_key_de_cuenta(cuenta_id):
 
 # Imagen PROPIA con COLMAP + OpenMVS precompilados (para generar malla).
 # Construida con GitHub Actions y subida a Docker Hub.
-RUNPOD_IMAGE        = "felipegil0106/gaussian-mesh:v1"
+RUNPOD_IMAGE        = "felipegil0106/gaussian-mesh:v2"
 
 # Configuración del Pod (LO QUE PEDISTE: cont 50, vol 100)
 POD_CONTAINER_DISK_GB = 50
