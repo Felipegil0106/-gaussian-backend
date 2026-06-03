@@ -791,10 +791,16 @@ async def worker_callback(job_id: str, request: Request,
     now = datetime.now(timezone.utc).isoformat()
 
     if cb_type == "progress":
-        job_update(job_id,
-                   progress=float(payload.get("progress", 0)),
-                   message=payload.get("message", "")[:200],
-                   last_heartbeat=now)
+        # Guardar el log que viene en CADA heartbeat (si viene). Así, si el pod
+        # muere de golpe (p.ej. Poisson sin memoria), el backend ya tiene el log
+        # hasta donde llegó y se puede descargar completo (antes salía "Sin log").
+        campos = dict(progress=float(payload.get("progress", 0)),
+                      message=payload.get("message", "")[:200],
+                      last_heartbeat=now)
+        log_parcial = payload.get("log")
+        if log_parcial:
+            campos["worker_log"] = log_parcial
+        job_update(job_id, **campos)
         return {"ok":True}
 
     elif cb_type == "completed":
