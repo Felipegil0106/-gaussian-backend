@@ -142,7 +142,11 @@ if not CALLBACK_SECRET:
 
 # Watchdog
 POD_MAX_LIFETIME_MIN     = 90
-POD_HEARTBEAT_TIMEOUT_MIN = 20
+# 30 min: damos margen sobre el límite de seguridad de Poisson (20 min). El
+# heartbeat del worker late cada 30s en un hilo aparte, así que aunque Poisson
+# bloquee el proceso principal, el heartbeat sigue llegando y el pod NO se mata.
+# Con 30 > 20 evitamos cualquier choque entre el watchdog y el trabajo de Poisson.
+POD_HEARTBEAT_TIMEOUT_MIN = 30
 WATCHDOG_INTERVAL_SEC    = 300  # 5 min
 
 PORT = int(os.environ.get("PORT", "8000"))
